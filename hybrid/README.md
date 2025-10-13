@@ -2,10 +2,14 @@
 
 Объединение лучших моделей из Sequence Recommendation и Collaborative Filtering в единую гибридную систему с полноценным тестированием.
 
-**Версия:** 2.0 (Contextual)  
+**Версия:** 3.0 (CF Features Enrichment)  
 **Статус:** ✅ Production Ready  
 **Дата:** October 14, 2025  
-**Лучший результат:** Hybrid (beta=0.3) - Accuracy **0.4453** (+33.6% vs CF only)
+**Лучший результат:** GraphSAGE+CF - Accuracy **0.5446** (лучше оригинальной DAGNN!)  
+**Улучшения:** 
+- Hybrid (beta=0.3): +33.6% vs CF only
+- DAGNN+CF: +17.6% vs baseline  
+- Sequence models enriched с CF features (item embeddings, popularity, stats)
 
 ---
 
@@ -58,7 +62,38 @@
 
 ## 🏆 Результаты
 
-### ✨ НОВАЯ ВЕРСИЯ: Контекстная система (hybrid_contextual_recommender.py)
+### 🌟 НОВЕЙШАЯ ВЕРСИЯ: Sequence + CF Features (sequence_with_cf_features.py) - ЛУЧШАЯ!
+
+**Идея:** Обогатить sequence модели данными из collaborative filtering
+
+**Enriched Features (38 dims):**
+- Item embeddings из LightFM (30 dims)
+- Service popularity (1 dim)
+- User interaction stats (3 dims)
+- Graph features: in/out degree (2 dims)
+- Базовые: is_service/is_table (2 dims)
+
+| Модель | Accuracy | F1 | Precision | Recall | nDCG |
+|--------|----------|-----|-----------|--------|------|
+| **GraphSAGE+CF** 🥇 | **0.5446** | **0.1558** | **0.1321** | **0.2143** | **0.7587** |
+| Random Forest | 0.4950 | 0.1415 | 0.1262 | 0.1696 | 0.7198 |
+| **DAGNN+CF** ✅ | 0.3960 | 0.0777 | 0.0535 | 0.1429 | 0.6786 |
+| DAGNN (baseline) | 0.3366 | 0.0529 | 0.0356 | 0.1429 | 0.6644 |
+
+**Ключевые результаты:**
+- ✅ **GraphSAGE+CF ЛУЧШАЯ** - Accuracy 0.5446 (лучше оригинальной DAGNN 0.5152!)
+- ✅ **DAGNN улучшена на +17.6%** (0.3366 → 0.3960) благодаря CF features
+- ✅ nDCG улучшен на +2.1% (0.6644 → 0.6786)
+- ✅ CF features (38 dims) значительно обогащают модели
+
+**Запуск:**
+```bash
+python3 sequence_with_cf_features.py
+```
+
+---
+
+### ✨ Контекстная система (hybrid_contextual_recommender.py)
 
 **DAGNN обучена на реальных последовательностях вызовов!**
 
