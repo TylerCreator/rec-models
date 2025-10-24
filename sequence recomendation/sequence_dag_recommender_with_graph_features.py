@@ -947,11 +947,21 @@ def main():
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
 
-    # Stratified split
-    logger.info("Using STRATIFIED split to ensure balanced classes...")
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=args.test_size, random_state=args.random_seed, stratify=y
-    )
+    # Stratified split (с проверкой возможности стратификации)
+    y_counts = Counter(y)
+    min_samples_y = min(y_counts.values())
+    
+    if min_samples_y >= 2:
+        logger.info("Using STRATIFIED split to ensure balanced classes...")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=args.test_size, random_state=args.random_seed, stratify=y
+        )
+    else:
+        logger.warning(f"Too few samples for stratification (min={min_samples_y}). Using random split.")
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=args.test_size, random_state=args.random_seed
+        )
+    
     logger.info(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
     logger.info(f"Train class distribution: {Counter(y_train)}")
     logger.info(f"Test class distribution: {Counter(y_test)}")
@@ -1070,12 +1080,24 @@ def main():
     logger.info(f"Training GRU4Rec with seed={args.random_seed + 4}...")
     sequences_all, lengths_all, targets_gru = prepare_gru4rec_data(X_raw, y_raw, node_map, max_seq_len=10)
     
-    train_idx, test_idx = train_test_split(
-        range(len(sequences_all)), 
-        test_size=args.test_size, 
-        random_state=args.random_seed,
-        stratify=targets_gru.numpy()
-    )
+    # Стратифицированный split для GRU (с проверкой)
+    targets_gru_counts = Counter(targets_gru.numpy())
+    min_samples_gru = min(targets_gru_counts.values())
+    
+    if min_samples_gru >= 2:
+        train_idx, test_idx = train_test_split(
+            range(len(sequences_all)), 
+            test_size=args.test_size, 
+            random_state=args.random_seed,
+            stratify=targets_gru.numpy()
+        )
+    else:
+        logger.warning(f"Too few samples for stratification in GRU data (min={min_samples_gru}). Using random split.")
+        train_idx, test_idx = train_test_split(
+            range(len(sequences_all)), 
+            test_size=args.test_size, 
+            random_state=args.random_seed
+        )
     
     sequences_train = sequences_all[train_idx]
     lengths_train = lengths_all[train_idx]
