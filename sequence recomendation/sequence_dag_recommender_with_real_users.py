@@ -240,9 +240,10 @@ def extract_real_users_from_json(json_path: Path) -> Tuple[Dict[str, str], Dict[
     return node_to_owner, owner_services
 
 
-def load_dag_from_json_with_users(json_path: Path) -> Tuple[nx.DiGraph, Dict[str, str]]:
+def load_dag_from_json_with_users(json_path: Path) -> Tuple[nx.DiGraph, Dict[str, str], List]:
     """
     Загружает DAG и извлекает реальных пользователей
+    Возвращает также исходные данные композиций для извлечения реальных путей
     """
     logger.info(f"Loading DAG from {json_path}")
     
@@ -294,27 +295,78 @@ def load_dag_from_json_with_users(json_path: Path) -> Tuple[nx.DiGraph, Dict[str
 
     logger.info(f"Loaded DAG with {dag.number_of_nodes()} nodes and {dag.number_of_edges()} edges")
     
-    return dag, node_to_owner
+    return dag, node_to_owner, data
 
 
-def extract_paths_from_dag(dag: nx.DiGraph) -> List[List[str]]:
-    logger.info("Extracting paths from DAG")
-    paths = []
-
-    for start_node in dag.nodes:
-        if dag.out_degree(start_node) > 0:
-            for path in nx.dfs_edges(dag, source=start_node):
-                full_path = [path[0], path[1]]
-                while dag.out_degree(full_path[-1]) > 0:
-                    next_nodes = list(dag.successors(full_path[-1]))
-                    if not next_nodes:
-                        break
-                    full_path.append(next_nodes[0])
-                if len(full_path) > 1:
-                    paths.append(full_path)
-
-    logger.info(f"Extracted {len(paths)} paths")
-    return paths
+def extract_paths_from_compositions(data: List, id_to_node: Dict[str, str]) -> List[List[str]]:
+    """
+    Извлекает РЕАЛЬНЫЕ пути из композиций (не искусственные через DFS)
+    
+    Args:
+        data: исходные данные из compositionsDAG.json
+        id_to_node: маппинг id -> node_name
+    
+    Returns:
+        List of real paths from compositions
+    """
+    logger.info("Extracting REAL paths from compositions (not synthetic DFS paths)")
+    
+    # Создаем маппинг id -> node_name
+    all_paths = []
+    
+    for comp_idx, composition in enumerate(data):
+        # Строим граф для этой конкретной композиции
+        comp_graph = nx.DiGraph()
+        id_to_mid = {}
+        
+        # Создаем маппинг для этой композиции
+        for node in composition["nodes"]:
+            node_id = str(node["id"])
+            if "mid" in node:
+                node_name = f"service_{node['mid']}"
+            else:
+                node_name = f"table_{node['id']}"
+            id_to_mid[node_id] = node_name
+        
+        # Добавляем ребра из этой композиции
+        for link in composition["links"]:
+            source = str(link["source"])
+            target = str(link["target"])
+            if source in id_to_mid and target in id_to_mid:
+                comp_graph.add_edge(id_to_mid[source], id_to_mid[target])
+        
+        # Извлекаем все простые пути в этой композиции
+        # Находим начальные узлы (без входящих ребер)
+        start_nodes = [n for n in comp_graph.nodes() if comp_graph.in_degree(n) == 0]
+        
+        # Находим конечные узлы (без исходящих ребер)
+        end_nodes = [n for n in comp_graph.nodes() if comp_graph.out_degree(n) == 0]
+        
+        # Извлекаем все пути от начальных к конечным узлам
+        for start in start_nodes:
+            for end in end_nodes:
+                try:
+                    # Находим все простые пути
+                    for path in nx.all_simple_paths(comp_graph, start, end):
+                        if len(path) > 1:  # Минимум 2 узла
+                            all_paths.append(path)
+                except nx.NetworkXNoPath:
+                    continue
+    
+    logger.info(f"Extracted {len(all_paths)} REAL paths from {len(data)} compositions")
+    
+    # Удаляем дубликаты (сохраняя порядок)
+    unique_paths = []
+    seen = set()
+    for path in all_paths:
+        path_tuple = tuple(path)
+        if path_tuple not in seen:
+            seen.add(path_tuple)
+            unique_paths.append(path)
+    
+    logger.info(f"Unique paths: {len(unique_paths)}")
+    
+    return unique_paths
 
 
 def create_training_data_with_users(
@@ -615,24 +667,40 @@ def main():
         logger.error(f"Data file not found: {data_path}")
         sys.exit(1)
 
-    dag, node_to_owner = load_dag_from_json_with_users(data_path)
-    paths = extract_paths_from_dag(dag)
+    dag, node_to_owner, compositions_data = load_dag_from_json_with_users(data_path)
+    
+    # Извлекаем РЕАЛЬНЫЕ пути из композиций (не искусственные через DFS)
+    paths = extract_paths_from_compositions(compositions_data, {})
+    
     X_raw, y_raw, user_ids_raw = create_training_data_with_users(paths, node_to_owner)
 
     # Prepare data
     data_pyg, contexts, targets, user_ids_tensor, node_map, user_encoder = \
         prepare_pytorch_geometric_data_with_real_users(dag, X_raw, y_raw, user_ids_raw)
     
-    # Split data
-    logger.info("Splitting data with stratification...")
-    (contexts_train, contexts_test, 
-     targets_train, targets_test,
-     user_ids_train, user_ids_test) = train_test_split(
-        contexts, targets, user_ids_tensor,
-        test_size=args.test_size,
-        random_state=args.random_seed,
-        stratify=targets.numpy()
-    )
+    # Split data (с проверкой возможности стратификации)
+    target_counts = Counter(targets.numpy())
+    min_samples = min(target_counts.values())
+    
+    if min_samples >= 2:
+        logger.info("Splitting data with stratification...")
+        (contexts_train, contexts_test, 
+         targets_train, targets_test,
+         user_ids_train, user_ids_test) = train_test_split(
+            contexts, targets, user_ids_tensor,
+            test_size=args.test_size,
+            random_state=args.random_seed,
+            stratify=targets.numpy()
+        )
+    else:
+        logger.warning(f"Too few samples for stratification (min={min_samples}). Using random split.")
+        (contexts_train, contexts_test, 
+         targets_train, targets_test,
+         user_ids_train, user_ids_test) = train_test_split(
+            contexts, targets, user_ids_tensor,
+            test_size=args.test_size,
+            random_state=args.random_seed
+        )
     
     num_users = len(user_encoder)
     
