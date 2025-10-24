@@ -221,10 +221,14 @@ class SASRec(nn.Module):
     """
     
     def __init__(self, num_items: int, hidden_size: int = 64, num_heads: int = 2, 
-                 num_blocks: int = 2, dropout: float = 0.3, max_len: int = 50):
+                 num_blocks: int = 2, dropout: float = 0.3, max_len: int = 50, num_classes: int = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_items = num_items
+        
+        # Если num_classes не задан, используем num_items
+        if num_classes is None:
+            num_classes = num_items
         
         # Embeddings
         self.item_embedding = nn.Embedding(num_items + 1, hidden_size, padding_idx=0)
@@ -246,7 +250,8 @@ class SASRec(nn.Module):
         ])
         
         self.layer_norm = nn.LayerNorm(hidden_size)
-        self.fc = nn.Linear(hidden_size, num_items)
+        # Выходной слой предсказывает только целевые классы (сервисы)
+        self.fc = nn.Linear(hidden_size, num_classes)
     
     def forward(self, sequences):
         """
@@ -293,10 +298,14 @@ class Caser(nn.Module):
     
     def __init__(self, num_items: int, embedding_dim: int = 64, 
                  num_h_filters: int = 16, num_v_filters: int = 4,
-                 dropout: float = 0.3, L: int = 5):
+                 dropout: float = 0.3, L: int = 5, num_classes: int = None):
         super().__init__()
         self.L = L  # Длина последовательности для convolution
         self.num_items = num_items
+        
+        # Если num_classes не задан, используем num_items
+        if num_classes is None:
+            num_classes = num_items
         
         # Embedding
         self.item_embedding = nn.Embedding(num_items + 1, embedding_dim, padding_idx=0)
@@ -319,7 +328,8 @@ class Caser(nn.Module):
         self.fc1 = nn.Linear(fc_input_dim, 128)
         self.bn1 = nn.BatchNorm1d(128)
         
-        self.fc2 = nn.Linear(128, num_items)
+        # Выходной слой предсказывает только целевые классы (сервисы)
+        self.fc2 = nn.Linear(128, num_classes)
     
     def forward(self, sequences):
         """
@@ -372,6 +382,188 @@ class Caser(nn.Module):
         return out
 
 
+class DAGNNSequential(nn.Module):
+    """
+    DAGNN + Sequential - Гибридная модель
+    Объединяет графовые связи (DAGNN) с моделированием последовательности (GRU)
+    
+    Архитектура:
+    1. DAGNN обрабатывает весь граф → node embeddings
+    2. Извлекаем embeddings для всех узлов в последовательности
+    3. GRU обрабатывает последовательность embeddings
+    4. Финальное предсказание на основе последнего hidden state
+    """
+    
+    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int,
+                 K: int = 10, num_gru_layers: int = 2, dropout: float = 0.4):
+        super().__init__()
+        self.dropout = dropout
+        self.hidden_channels = hidden_channels
+        self.num_gru_layers = num_gru_layers
+        
+        # DAGNN для обработки графа
+        self.lin1 = nn.Linear(in_channels, hidden_channels)
+        self.bn1 = nn.BatchNorm1d(hidden_channels)
+        
+        self.dagnn = DAGNN(hidden_channels, K, dropout=dropout)
+        
+        # GRU для обработки последовательности
+        self.gru = nn.GRU(
+            input_size=hidden_channels,
+            hidden_size=hidden_channels,
+            num_layers=num_gru_layers,
+            batch_first=True,
+            dropout=dropout if num_gru_layers > 1 else 0
+        )
+        
+        # Output layers
+        self.bn2 = nn.BatchNorm1d(hidden_channels)
+        self.lin_out = nn.Linear(hidden_channels, out_channels)
+    
+    def forward(self, x, edge_index, sequences, lengths, training=True):
+        """
+        Args:
+            x: node features [num_nodes, in_channels]
+            edge_index: graph edges [2, num_edges]
+            sequences: node indices in sequences [batch_size, seq_len]
+            lengths: real sequence lengths [batch_size]
+            training: bool
+        Returns:
+            predictions [batch_size, out_channels]
+        """
+        # 1. DAGNN: получаем embeddings для всех узлов
+        x = self.lin1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=training)
+        
+        node_embeddings = self.dagnn(x, edge_index, training=training)  # [num_nodes, hidden_channels]
+        
+        # 2. Извлекаем embeddings для узлов в последовательностях
+        batch_size, seq_len = sequences.shape
+        
+        # Создаем padding embedding (нулевой вектор)
+        padding_emb = torch.zeros(1, self.hidden_channels, device=node_embeddings.device)
+        node_embeddings_with_padding = torch.cat([padding_emb, node_embeddings], dim=0)
+        # Теперь индекс 0 = padding, индексы 1..N = реальные узлы
+        
+        # Flatten sequences для индексирования
+        flat_sequences = sequences.view(-1)  # [batch_size * seq_len]
+        
+        # Получаем embeddings
+        seq_embeddings = node_embeddings_with_padding[flat_sequences]  # [batch_size * seq_len, hidden_channels]
+        seq_embeddings = seq_embeddings.view(batch_size, seq_len, self.hidden_channels)
+        
+        # 3. GRU обрабатывает последовательность
+        # Pack padded sequence для эффективности
+        packed = nn.utils.rnn.pack_padded_sequence(
+            seq_embeddings, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        gru_out, hidden = self.gru(packed)
+        
+        # Берем последний hidden state
+        last_hidden = hidden[-1]  # [batch_size, hidden_channels]
+        
+        # 4. Финальное предсказание
+        out = self.bn2(last_hidden)
+        out = F.relu(out)
+        out = F.dropout(out, p=self.dropout, training=training)
+        out = self.lin_out(out)
+        
+        return out
+
+
+class DAGNNAttention(nn.Module):
+    """
+    DAGNN + Attention - Гибридная модель
+    Использует attention mechanism для взвешивания узлов в последовательности
+    
+    Архитектура:
+    1. DAGNN обрабатывает граф → node embeddings
+    2. Multi-head attention по последовательности узлов
+    3. Финальное предсказание
+    """
+    
+    def __init__(self, in_channels: int, hidden_channels: int, out_channels: int,
+                 K: int = 10, num_heads: int = 4, dropout: float = 0.4):
+        super().__init__()
+        self.dropout = dropout
+        self.hidden_channels = hidden_channels
+        
+        # DAGNN для обработки графа
+        self.lin1 = nn.Linear(in_channels, hidden_channels)
+        self.bn1 = nn.BatchNorm1d(hidden_channels)
+        
+        self.dagnn = DAGNN(hidden_channels, K, dropout=dropout)
+        
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_channels,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        self.layer_norm = nn.LayerNorm(hidden_channels)
+        
+        # Output layers
+        self.lin2 = nn.Linear(hidden_channels, hidden_channels // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_channels // 2)
+        self.lin_out = nn.Linear(hidden_channels // 2, out_channels)
+    
+    def forward(self, x, edge_index, sequences, mask=None, training=True):
+        """
+        Args:
+            x: node features [num_nodes, in_channels]
+            edge_index: graph edges [2, num_edges]
+            sequences: node indices in sequences [batch_size, seq_len]
+            mask: attention mask [batch_size, seq_len] (optional)
+            training: bool
+        Returns:
+            predictions [batch_size, out_channels]
+        """
+        # 1. DAGNN: получаем embeddings для всех узлов
+        x = self.lin1(x)
+        x = self.bn1(x)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.dropout, training=training)
+        
+        node_embeddings = self.dagnn(x, edge_index, training=training)
+        
+        # 2. Извлекаем embeddings для узлов в последовательностях
+        batch_size, seq_len = sequences.shape
+        
+        # Создаем padding embedding (нулевой вектор)
+        padding_emb = torch.zeros(1, self.hidden_channels, device=node_embeddings.device)
+        node_embeddings_with_padding = torch.cat([padding_emb, node_embeddings], dim=0)
+        
+        flat_sequences = sequences.view(-1)
+        seq_embeddings = node_embeddings_with_padding[flat_sequences]
+        seq_embeddings = seq_embeddings.view(batch_size, seq_len, self.hidden_channels)
+        
+        # 3. Self-attention по последовательности
+        attn_out, attn_weights = self.attention(
+            seq_embeddings, seq_embeddings, seq_embeddings,
+            key_padding_mask=mask
+        )
+        
+        # Residual connection + LayerNorm
+        seq_embeddings = self.layer_norm(seq_embeddings + attn_out)
+        
+        # 4. Aggregation: берем последний элемент последовательности
+        # Или можно использовать mean/max pooling
+        last_output = seq_embeddings[:, -1, :]  # [batch_size, hidden_channels]
+        
+        # 5. Финальное предсказание
+        out = self.lin2(last_output)
+        out = self.bn2(out)
+        out = F.relu(out)
+        out = F.dropout(out, p=self.dropout, training=training)
+        out = self.lin_out(out)
+        
+        return out
+
+
 class GRU4Rec(nn.Module):
     """
     GRU4Rec - Рекуррентная модель для session-based рекомендаций
@@ -385,13 +577,17 @@ class GRU4Rec(nn.Module):
     """
     
     def __init__(self, num_items: int, embedding_dim: int = 64, hidden_size: int = 128, 
-                 num_layers: int = 2, dropout: float = 0.3):
+                 num_layers: int = 2, dropout: float = 0.3, num_classes: int = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dropout = dropout
         
-        # Embedding для узлов графа
+        # Если num_classes не задан, используем num_items (backward compatibility)
+        if num_classes is None:
+            num_classes = num_items
+        
+        # Embedding для узлов графа (все узлы, включая padding)
         self.embedding = nn.Embedding(num_items, embedding_dim, padding_idx=0)
         
         # Multi-layer GRU
@@ -410,7 +606,8 @@ class GRU4Rec(nn.Module):
         self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
         self.bn2 = nn.BatchNorm1d(hidden_size // 2)
         
-        self.fc2 = nn.Linear(hidden_size // 2, num_items)
+        # Выходной слой предсказывает только целевые классы (сервисы)
+        self.fc2 = nn.Linear(hidden_size // 2, num_classes)
         
         self.dropout_layer = nn.Dropout(dropout)
         
@@ -582,6 +779,92 @@ def build_graph_from_real_paths(paths: List[List[str]]) -> nx.DiGraph:
     return path_graph
 
 
+def extract_honest_graph_features(graph: nx.DiGraph, X_raw: List) -> np.ndarray:
+    """
+    Извлекает ЧЕСТНЫЕ графовые признаки БЕЗ использования target
+    
+    Признаки основаны ТОЛЬКО на контексте:
+    - Характеристики последнего узла в контексте
+    - Характеристики возможных следующих узлов (соседей)
+    - Статистики по всему контексту
+    
+    НЕ используем: target node, расстояние до target, ребра к target
+    """
+    logger.info("Extracting HONEST graph features (without target leakage)...")
+    
+    # Вычисляем метрики графа один раз
+    pagerank = nx.pagerank(graph)
+    in_degree = dict(graph.in_degree())
+    out_degree = dict(graph.out_degree())
+    
+    try:
+        betweenness = nx.betweenness_centrality(graph)
+    except:
+        betweenness = {node: 0.0 for node in graph.nodes()}
+    
+    try:
+        clustering = nx.clustering(graph.to_undirected())
+    except:
+        clustering = {node: 0.0 for node in graph.nodes()}
+    
+    # Нормализация
+    max_in = max(in_degree.values()) if in_degree else 1
+    max_out = max(out_degree.values()) if out_degree else 1
+    
+    graph_features = []
+    
+    for context in X_raw:
+        features = []
+        last_node = context[-1]
+        
+        # === Признаки ПОСЛЕДНЕГО узла (откуда переходим) ===
+        features.append(in_degree.get(last_node, 0) / max_in)
+        features.append(out_degree.get(last_node, 0) / max_out)
+        features.append(pagerank.get(last_node, 0))
+        features.append(betweenness.get(last_node, 0))
+        features.append(clustering.get(last_node, 0))
+        features.append(1 if last_node.startswith('service') else 0)
+        
+        # === Признаки КОНТЕКСТА ===
+        features.append(len(context))  # Длина контекста
+        
+        # Средние значения по всему контексту
+        context_pagerank = [pagerank.get(node, 0) for node in context]
+        context_out_deg = [out_degree.get(node, 0) / max_out for node in context]
+        
+        features.append(np.mean(context_pagerank) if context_pagerank else 0)
+        features.append(np.max(context_pagerank) if context_pagerank else 0)
+        features.append(np.mean(context_out_deg) if context_out_deg else 0)
+        
+        # === Признаки ВОЗМОЖНЫХ следующих узлов (соседи последнего узла) ===
+        successors = list(graph.successors(last_node))
+        features.append(len(successors))  # Сколько вариантов для следующего шага
+        
+        if successors:
+            # Характеристики соседей (агрегированные)
+            succ_pagerank = [pagerank.get(s, 0) for s in successors]
+            succ_in_deg = [in_degree.get(s, 0) / max_in for s in successors]
+            
+            features.append(np.mean(succ_pagerank))
+            features.append(np.max(succ_pagerank))
+            features.append(np.mean(succ_in_deg))
+            features.append(np.max(succ_in_deg))
+            
+            # Сколько соседей являются services
+            service_count = sum(1 for s in successors if s.startswith('service'))
+            features.append(service_count / len(successors) if successors else 0)
+        else:
+            # Нет соседей - нулевые признаки
+            features.extend([0, 0, 0, 0, 0])
+        
+        graph_features.append(features)
+    
+    graph_features_array = np.array(graph_features, dtype=np.float32)
+    logger.info(f"Extracted honest graph features: shape {graph_features_array.shape}")
+    
+    return graph_features_array
+
+
 def create_training_data(paths: List[List[str]]) -> Tuple[List, List]:
     """
     Создает обучающие примеры из путей
@@ -609,10 +892,22 @@ def create_training_data(paths: List[List[str]]) -> Tuple[List, List]:
     return X_raw, y_raw
 
 
-def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, paths: List[List[str]]) -> Tuple[Data, torch.Tensor, torch.Tensor, Dict]:
+def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, paths: List[List[str]]) -> Tuple[Data, torch.Tensor, torch.Tensor, Dict, Dict]:
     """
     Подготовка данных для PyTorch Geometric
     Граф строится из РЕАЛЬНЫХ путей
+    
+    ОПТИМАЛЬНАЯ КОНФИГУРАЦИЯ для малого датасета:
+    - Направленный граф (сохраняет DAG семантику)
+    - БЕЗ self-loops (меньше переобучение)
+    - БЕЗ симметризации (сохраняет причинно-следственные связи)
+    
+    Returns:
+        data_pyg: Graph data (направленный граф, 97 ребер)
+        contexts: Context node indices (in node_map)
+        targets: Target service indices (in service_map)
+        node_map: Mapping all nodes -> indices
+        service_map: Mapping only services -> indices (for predictions)
     """
     logger.info("Preparing PyTorch Geometric data from real paths...")
     
@@ -624,31 +919,42 @@ def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, pa
     node_ids = node_encoder.fit_transform(node_list)
     node_map = {node: idx for node, idx in zip(node_list, node_ids)}
 
+    # Направленный граф БЕЗ модификаций (оптимально для малого датасета)
     edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in path_graph.edges], dtype=torch.long).t()
     features = [[1, 0] if path_graph.nodes[n]['type'] == 'service' else [0, 1] for n in node_list]
     x = torch.tensor(features, dtype=torch.float)
     data_pyg = Data(x=x, edge_index=edge_index)
+    
+    logger.info(f"Graph: {edge_index.size(1)} directed edges (no self-loops, no symmetrization)")
 
     contexts = torch.tensor([node_map[context[-1]] for context in X_raw], dtype=torch.long)
-    targets = torch.tensor([node_map[y] for y in y_raw], dtype=torch.long)
+    
+    # Создаем отдельный маппинг ТОЛЬКО для сервисов (целевых классов)
+    unique_services = sorted(set(y_raw))
+    service_map = {service: idx for idx, service in enumerate(unique_services)}
+    targets = torch.tensor([service_map[y] for y in y_raw], dtype=torch.long)
+    
+    logger.info(f"Created service_map: {len(service_map)} unique target services")
+    logger.info(f"Services: {unique_services}")
 
-    return data_pyg, contexts, targets, node_map
+    return data_pyg, contexts, targets, node_map, service_map
 
 
-def prepare_gru4rec_data(X_raw: List, y_raw: List, node_map: Dict, max_seq_len: int = 10) -> Tuple:
+def prepare_gru4rec_data(X_raw: List, y_raw: List, node_map: Dict, service_map: Dict, max_seq_len: int = 10) -> Tuple:
     """
     Подготовка данных для GRU4Rec
     
     Args:
         X_raw: Список контекстов (туплы узлов)
-        y_raw: Список целевых узлов
-        node_map: Маппинг узлов в индексы
+        y_raw: Список целевых узлов (сервисов)
+        node_map: Маппинг всех узлов в индексы (для входных последовательностей)
+        service_map: Маппинг сервисов в индексы (для целевых значений)
         max_seq_len: Максимальная длина последовательности
     
     Returns:
-        sequences: (num_samples, max_seq_len) - padded последовательности
+        sequences: (num_samples, max_seq_len) - padded последовательности (индексы в node_map)
         lengths: (num_samples,) - реальные длины
-        targets: (num_samples,) - целевые узлы
+        targets: (num_samples,) - целевые сервисы (индексы в service_map)
     """
     logger.info("Preparing GRU4Rec data")
     
@@ -657,7 +963,7 @@ def prepare_gru4rec_data(X_raw: List, y_raw: List, node_map: Dict, max_seq_len: 
     targets_list = []
     
     for context, target in zip(X_raw, y_raw):
-        # Преобразуем контекст в индексы
+        # Преобразуем контекст в индексы (используем node_map для всех узлов)
         seq = [node_map[node] + 1 for node in context]  # +1 для padding_idx=0
         seq_len = len(seq)
         
@@ -670,15 +976,61 @@ def prepare_gru4rec_data(X_raw: List, y_raw: List, node_map: Dict, max_seq_len: 
         
         sequences.append(seq)
         lengths.append(min(seq_len, max_seq_len))
-        targets_list.append(node_map[target])
+        # Целевой сервис используем из service_map (только сервисы)
+        targets_list.append(service_map[target])
     
     sequences = torch.tensor(sequences, dtype=torch.long)
     lengths = torch.tensor(lengths, dtype=torch.long)
     targets_tensor = torch.tensor(targets_list, dtype=torch.long)
     
     logger.info(f"GRU4Rec data: {sequences.shape}, lengths: {lengths.shape}")
+    logger.info(f"Targets use service_map: {len(service_map)} classes")
     
     return sequences, lengths, targets_tensor
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss для борьбы с несбалансированными классами
+    Уменьшает вес "легких" примеров и фокусируется на "сложных"
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha  # Веса классов
+        self.gamma = gamma  # Фокусирующий параметр
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', weight=self.alpha)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+def label_smoothing_loss(pred, target, smoothing=0.1, num_classes=None):
+    """
+    Label smoothing для предотвращения переобучения
+    Вместо one-hot [0, 1, 0] использует [0.05, 0.9, 0.05]
+    """
+    if num_classes is None:
+        num_classes = pred.size(-1)
+    
+    confidence = 1.0 - smoothing
+    smooth_value = smoothing / (num_classes - 1)
+    
+    one_hot = torch.zeros_like(pred).scatter_(1, target.unsqueeze(1), 1)
+    smooth_one_hot = one_hot * confidence + (1 - one_hot) * smooth_value
+    
+    log_probs = F.log_softmax(pred, dim=-1)
+    loss = -(smooth_one_hot * log_probs).sum(dim=-1).mean()
+    
+    return loss
 
 
 def evaluate_model_with_ndcg(preds: np.ndarray, true_labels: np.ndarray,
@@ -702,6 +1054,10 @@ def evaluate_model_with_ndcg(preds: np.ndarray, true_labels: np.ndarray,
     logger.info(f"Unique predictions: {len(unique_preds)} (classes: {unique_preds})")
     pred_dist = Counter(preds)
     logger.info(f"Prediction distribution: {dict(sorted(pred_dist.items()))}")
+    
+    # WARNING для mode collapse
+    if len(unique_preds) < len(np.unique(true_labels)) / 2:
+        logger.warning(f"⚠️  MODE COLLAPSE DETECTED! Predicting only {len(unique_preds)}/{len(np.unique(true_labels))} classes")
 
     if proba_preds is not None:
         try:
@@ -777,10 +1133,86 @@ def train_model_generic(model, data_pyg, contexts_train, targets_train, contexts
     return preds, proba
 
 
+def train_model_with_focal_loss(model, data_pyg, contexts_train, targets_train, contexts_test, targets_test,
+                                optimizer, scheduler, epochs, model_name, model_seed, 
+                                class_weights=None, use_label_smoothing=True):
+    """
+    Улучшенная функция обучения с Focal Loss и Label Smoothing
+    Борется с mode collapse и несбалансированными классами
+    """
+    
+    torch.manual_seed(model_seed)
+    np.random.seed(model_seed)
+    
+    # Создаем Focal Loss с весами классов
+    if class_weights is not None:
+        class_weights_tensor = torch.FloatTensor(class_weights)
+        focal_criterion = FocalLoss(alpha=class_weights_tensor, gamma=2.0)
+    else:
+        focal_criterion = FocalLoss(gamma=2.0)
+    
+    best_loss = float('inf')
+    patience_counter = 0
+    patience = 50
+    num_classes = None
+
+    for epoch in tqdm(range(epochs), desc=f"{model_name} Training (Focal)"):
+        model.train()
+        optimizer.zero_grad()
+        
+        # Forward pass
+        if hasattr(model, 'dagnn'):  # DAGNN
+            out = model(data_pyg.x, data_pyg.edge_index, training=True)[contexts_train]
+        else:  # GCN, GraphSAGE
+            out = model(data_pyg, training=True)[contexts_train]
+        
+        # Получаем правильное количество классов из выхода модели (в первой эпохе)
+        if num_classes is None:
+            num_classes = out.size(-1)
+        
+        # Комбинированная loss: Focal Loss + Label Smoothing
+        if use_label_smoothing:
+            focal_loss = focal_criterion(out, targets_train)
+            smooth_loss = label_smoothing_loss(out, targets_train, smoothing=0.1, num_classes=num_classes)
+            loss = 0.7 * focal_loss + 0.3 * smooth_loss  # Взвешенная комбинация
+        else:
+            loss = focal_criterion(out, targets_train)
+        
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step(loss)
+        
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"   Early stopping at epoch {epoch}")
+                break
+
+    model.eval()
+    with torch.no_grad():
+        if hasattr(model, 'dagnn'):
+            test_output = model(data_pyg.x, data_pyg.edge_index, training=False)[contexts_test]
+        else:
+            test_output = model(data_pyg, training=False)[contexts_test]
+        
+        # Temperature scaling для лучшей калибровки
+        temperature = 1.5
+        test_output = test_output / temperature
+        
+        preds = test_output.argmax(dim=1).numpy()
+        proba = F.softmax(test_output, dim=1).numpy()
+
+    return preds, proba
+
+
 def train_sasrec(
     sequences_train, targets_train, sequences_test, targets_test,
     num_items, epochs, hidden_size=64, num_heads=2, num_blocks=2,
-    dropout=0.3, lr=0.001, model_seed=42
+    dropout=0.3, lr=0.001, model_seed=42, num_classes=None
 ):
     """Обучение SASRec модели"""
     
@@ -789,8 +1221,13 @@ def train_sasrec(
     torch.manual_seed(model_seed)
     np.random.seed(model_seed)
     
+    # Если num_classes не задан, используем num_items
+    if num_classes is None:
+        num_classes = num_items
+    
     model = SASRec(
         num_items=num_items + 1,
+        num_classes=num_classes,
         hidden_size=hidden_size,
         num_heads=num_heads,
         num_blocks=num_blocks,
@@ -837,10 +1274,180 @@ def train_sasrec(
     return preds, proba
 
 
+def train_dagnn_sequential(
+    data_pyg, sequences_train, lengths_train, targets_train,
+    sequences_test, lengths_test, targets_test,
+    hidden_channels, epochs, K=10, num_gru_layers=2,
+    dropout=0.4, lr=0.001, model_seed=42, num_service_classes=None
+):
+    """Обучение DAGNNSequential модели (DAGNN + GRU)"""
+    
+    logger.info(f"Training DAGNNSequential (hidden={hidden_channels}, K={K}, GRU_layers={num_gru_layers}, dropout={dropout})...")
+    
+    torch.manual_seed(model_seed)
+    np.random.seed(model_seed)
+    
+    # Определяем количество классов для предсказания
+    if num_service_classes is None:
+        num_service_classes = data_pyg.x.size(0)  # Fallback: все узлы
+    
+    # Создаем модель
+    model = DAGNNSequential(
+        in_channels=2,
+        hidden_channels=hidden_channels,
+        out_channels=num_service_classes,  # Предсказываем только сервисы
+        K=K,
+        num_gru_layers=num_gru_layers,
+        dropout=dropout
+    )
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=20
+    )
+    
+    best_loss = float('inf')
+    patience_counter = 0
+    patience = 50
+    
+    for epoch in tqdm(range(epochs), desc="DAGNNSequential Training"):
+        model.train()
+        optimizer.zero_grad()
+        
+        # Forward pass
+        out = model(
+            x=data_pyg.x,
+            edge_index=data_pyg.edge_index,
+            sequences=sequences_train,
+            lengths=lengths_train,
+            training=True
+        )
+        
+        loss = F.cross_entropy(out, targets_train)
+        
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step(loss)
+        
+        # Early stopping
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"   Early stopping at epoch {epoch}")
+                break
+    
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        test_output = model(
+            x=data_pyg.x,
+            edge_index=data_pyg.edge_index,
+            sequences=sequences_test,
+            lengths=lengths_test,
+            training=False
+        )
+        preds = test_output.argmax(dim=1).numpy()
+        proba = F.softmax(test_output, dim=1).numpy()
+    
+    return preds, proba
+
+
+def train_dagnn_attention(
+    data_pyg, sequences_train, targets_train,
+    sequences_test, targets_test,
+    hidden_channels, epochs, K=10, num_heads=4,
+    dropout=0.4, lr=0.001, model_seed=42, num_service_classes=None
+):
+    """Обучение DAGNNAttention модели (DAGNN + Attention)"""
+    
+    logger.info(f"Training DAGNNAttention (hidden={hidden_channels}, K={K}, heads={num_heads}, dropout={dropout})...")
+    
+    torch.manual_seed(model_seed)
+    np.random.seed(model_seed)
+    
+    # Определяем количество классов для предсказания
+    if num_service_classes is None:
+        num_service_classes = data_pyg.x.size(0)  # Fallback: все узлы
+    
+    # Создаем модель
+    model = DAGNNAttention(
+        in_channels=2,
+        hidden_channels=hidden_channels,
+        out_channels=num_service_classes,  # Предсказываем только сервисы
+        K=K,
+        num_heads=num_heads,
+        dropout=dropout
+    )
+    
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=20
+    )
+    
+    best_loss = float('inf')
+    patience_counter = 0
+    patience = 50
+    
+    for epoch in tqdm(range(epochs), desc="DAGNNAttention Training"):
+        model.train()
+        optimizer.zero_grad()
+        
+        # Создаем маску для padding
+        mask = (sequences_train == 0)
+        
+        # Forward pass
+        out = model(
+            x=data_pyg.x,
+            edge_index=data_pyg.edge_index,
+            sequences=sequences_train,
+            mask=mask,
+            training=True
+        )
+        
+        loss = F.cross_entropy(out, targets_train)
+        
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step(loss)
+        
+        # Early stopping
+        if loss.item() < best_loss:
+            best_loss = loss.item()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info(f"   Early stopping at epoch {epoch}")
+                break
+    
+    # Evaluation
+    model.eval()
+    with torch.no_grad():
+        mask_test = (sequences_test == 0)
+        test_output = model(
+            x=data_pyg.x,
+            edge_index=data_pyg.edge_index,
+            sequences=sequences_test,
+            mask=mask_test,
+            training=False
+        )
+        preds = test_output.argmax(dim=1).numpy()
+        proba = F.softmax(test_output, dim=1).numpy()
+    
+    return preds, proba
+
+
 def train_caser(
     sequences_train, targets_train, sequences_test, targets_test,
     num_items, epochs, embedding_dim=64, num_h_filters=16,
-    num_v_filters=4, dropout=0.3, lr=0.001, model_seed=42
+    num_v_filters=4, dropout=0.3, lr=0.001, model_seed=42, num_classes=None
 ):
     """Обучение Caser модели"""
     
@@ -849,8 +1456,13 @@ def train_caser(
     torch.manual_seed(model_seed)
     np.random.seed(model_seed)
     
+    # Если num_classes не задан, используем num_items
+    if num_classes is None:
+        num_classes = num_items
+    
     model = Caser(
         num_items=num_items + 1,
+        num_classes=num_classes,
         embedding_dim=embedding_dim,
         num_h_filters=num_h_filters,
         num_v_filters=num_v_filters,
@@ -901,7 +1513,7 @@ def train_gru4rec(
     sequences_train, lengths_train, targets_train,
     sequences_test, lengths_test, targets_test,
     num_items, epochs, embedding_dim=64, hidden_size=128,
-    num_layers=2, dropout=0.4, lr=0.001, model_seed=42
+    num_layers=2, dropout=0.4, lr=0.001, model_seed=42, num_classes=None
 ):
     """Обучение GRU4Rec модели"""
     
@@ -911,9 +1523,14 @@ def train_gru4rec(
     torch.manual_seed(model_seed)
     np.random.seed(model_seed)
     
+    # Если num_classes не задан, используем num_items (backward compatibility)
+    if num_classes is None:
+        num_classes = num_items
+    
     # Создаем модель
     model = GRU4Rec(
-        num_items=num_items + 1,  # +1 для padding
+        num_items=num_items,  # Для эмбеддингов (все узлы + padding)
+        num_classes=num_classes,  # Для предсказаний (только сервисы)
         embedding_dim=embedding_dim,
         hidden_size=hidden_size,
         num_layers=num_layers,
@@ -984,11 +1601,23 @@ def main():
     dag, compositions_data = load_dag_from_json(data_path)
     paths = extract_paths_from_compositions(compositions_data)
     X_raw, y_raw = create_training_data(paths)
+    
+    # Построим граф из реальных путей для извлечения честных фичей
+    path_graph = build_graph_from_real_paths(paths)
+    
+    # Извлекаем ЧЕСТНЫЕ графовые фичи (без утечки target)
+    honest_graph_features = extract_honest_graph_features(path_graph, X_raw)
 
     # Vectorize
     logger.info("Vectorizing data...")
     mlb = MultiLabelBinarizer()
-    X = mlb.fit_transform(X_raw)
+    X_base = mlb.fit_transform(X_raw)
+    
+    # Объединяем базовые признаки с честными графовыми
+    logger.info(f"Combining base features {X_base.shape} with honest graph features {honest_graph_features.shape}")
+    X_combined = np.hstack([X_base, honest_graph_features])
+    logger.info(f"Combined feature matrix shape: {X_combined.shape}")
+    
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
 
@@ -996,23 +1625,34 @@ def main():
     y_counts = Counter(y)
     min_samples = min(y_counts.values())
     
+    # Split для базовых признаков
     if min_samples >= 2:
         logger.info("Using STRATIFIED split to ensure balanced classes...")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=args.test_size, random_state=args.random_seed, stratify=y
+        X_base_train, X_base_test, y_train, y_test = train_test_split(
+            X_base, y, test_size=args.test_size, random_state=args.random_seed, stratify=y
         )
     else:
         logger.warning(f"Too few samples for stratification (min={min_samples}). Using random split.")
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=args.test_size, random_state=args.random_seed
+        X_base_train, X_base_test, y_train, y_test = train_test_split(
+            X_base, y, test_size=args.test_size, random_state=args.random_seed
         )
     
-    logger.info(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+    logger.info(f"Train samples: {len(X_base_train)}, Test samples: {len(X_base_test)}")
     logger.info(f"Train class distribution: {Counter(y_train)}")
     logger.info(f"Test class distribution: {Counter(y_test)}")
 
     # Prepare PyG data from real paths
-    data_pyg, contexts, targets, node_map = prepare_pytorch_geometric_data(dag, X_raw, y_raw, paths)
+    data_pyg, contexts, targets, node_map, service_map = prepare_pytorch_geometric_data(
+        dag, X_raw, y_raw, paths
+    )
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"📊 DATA SUMMARY:")
+    logger.info(f"  Total nodes in graph: {len(node_map)}")
+    logger.info(f"  Target service classes: {len(service_map)}")
+    logger.info(f"  Models will predict {len(service_map)} classes (services only)")
+    logger.info(f"  Graph edges: {data_pyg.edge_index.size(1)} (directed, no self-loops)")
+    logger.info(f"{'='*60}\n")
     
     # Стратифицированный split для графовых моделей (с проверкой)
     target_counts_graph = Counter(targets.numpy())
@@ -1032,18 +1672,6 @@ def main():
 
     results = {}
 
-    # Baseline: Random Forest
-    logger.info("Training Random Forest...")
-    np.random.seed(args.random_seed)
-    rf = RandomForestClassifier(n_estimators=200, max_depth=15, min_samples_split=5,
-                                random_state=args.random_seed, n_jobs=-1)
-    rf.fit(X_train, y_train)
-    rf_preds = rf.predict(X_test)
-    rf_proba = rf.predict_proba(X_test)
-    results['Random Forest'] = evaluate_model_with_ndcg(
-        rf_preds, y_test, proba_preds=rf_proba, name="Random Forest"
-    )
-
     # Popularity baseline
     logger.info("Training Popularity baseline...")
     counter = Counter(y_raw)
@@ -1062,7 +1690,7 @@ def main():
     gcn = GCNRecommender(
         in_channels=2, 
         hidden_channels=args.hidden_channels * 2,  # Больше capacity
-        out_channels=len(node_map), 
+        out_channels=len(service_map),  # Предсказываем только сервисы
         dropout=0.3  # Меньше dropout для лучшего обучения
     )
     opt_gcn = torch.optim.Adam(gcn.parameters(), lr=args.learning_rate * 1.5, weight_decay=5e-5)
@@ -1081,7 +1709,7 @@ def main():
     torch.manual_seed(args.random_seed + 2)
     dagnn = DAGNNRecommender(
         in_channels=2, hidden_channels=args.hidden_channels,
-        out_channels=len(node_map), dropout=0.4
+        out_channels=len(service_map), dropout=0.4  # Предсказываем только сервисы
     )
     opt_dagnn = torch.optim.Adam(dagnn.parameters(), lr=args.learning_rate * 0.8, weight_decay=1e-4)
     sched_dagnn = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_dagnn, mode='min', factor=0.5, patience=20)
@@ -1094,12 +1722,67 @@ def main():
         dagnn_preds, targets_test.numpy(), proba_preds=dagnn_proba, name="DAGNN"
     )
 
+    # DAGNN IMPROVED - с Focal Loss и Label Smoothing
+    logger.info("\n" + "="*70)
+    logger.info(f"Training DAGNN IMPROVED (Focal Loss + Label Smoothing) seed={args.random_seed + 20}...")
+    
+    # Вычисляем веса классов для борьбы с несбалансированностью
+    train_class_counts = Counter(targets_train.numpy())
+    total_samples = sum(train_class_counts.values())
+    num_all_classes = len(service_map)  # Всего сервисов (целевых классов)
+    
+    # Inverse frequency weights для ВСЕХ классов
+    class_weights = []
+    for i in range(num_all_classes):
+        count = train_class_counts.get(i, 1)  # Если класса нет, вес = среднему
+        if count > 0:
+            weight = total_samples / (len(train_class_counts) * count)
+        else:
+            weight = 1.0  # Нейтральный вес для классов которых нет в train
+        class_weights.append(weight)
+    
+    logger.info(f"Class weights (first 5): {[f'{w:.2f}' for w in class_weights[:5]]}")
+    logger.info(f"Total service classes: {num_all_classes}, Present in train: {len(train_class_counts)}")
+    logger.info(f"Using Focal Loss (gamma=2.0) + Label Smoothing (0.1)")
+    
+    torch.manual_seed(args.random_seed + 20)
+    dagnn_improved = DAGNNRecommender(
+        in_channels=2, 
+        hidden_channels=args.hidden_channels * 2,  # Больше capacity
+        out_channels=len(service_map),  # Предсказываем только сервисы
+        K=15,  # Больше propagation steps
+        dropout=0.5  # Больше dropout для регуляризации
+    )
+    opt_dagnn_improved = torch.optim.Adam(
+        dagnn_improved.parameters(), 
+        lr=args.learning_rate * 0.5,  # Меньше learning rate
+        weight_decay=5e-4  # Больше weight decay
+    )
+    sched_dagnn_improved = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt_dagnn_improved, mode='min', factor=0.5, patience=25
+    )
+    
+    dagnn_improved_preds, dagnn_improved_proba = train_model_with_focal_loss(
+        dagnn_improved, data_pyg, 
+        contexts_train, targets_train, 
+        contexts_test, targets_test,
+        opt_dagnn_improved, sched_dagnn_improved, args.epochs, 
+        "DAGNN-Improved", args.random_seed + 20,
+        class_weights=class_weights,
+        use_label_smoothing=True
+    )
+    results['DAGNN-Improved (Focal)'] = evaluate_model_with_ndcg(
+        dagnn_improved_preds, targets_test.numpy(), 
+        proba_preds=dagnn_improved_proba, 
+        name="DAGNN-Improved (Focal Loss + Label Smoothing)"
+    )
+
     # GraphSAGE - с еще другим seed
     logger.info(f"Training GraphSAGE with seed={args.random_seed + 3}...")
     torch.manual_seed(args.random_seed + 3)
     sage = GraphSAGERecommender(
         in_channels=2, hidden_channels=args.hidden_channels,
-        out_channels=len(node_map), dropout=0.4
+        out_channels=len(service_map), dropout=0.4  # Предсказываем только сервисы
     )
     opt_sage = torch.optim.Adam(sage.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     sched_sage = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_sage, mode='min', factor=0.5, patience=20)
@@ -1116,64 +1799,35 @@ def main():
     logger.info(f"Training GRU4Rec with seed={args.random_seed + 4}...")
     
     # Подготовка данных для GRU4Rec
-    sequences_all, lengths_all, targets_gru = prepare_gru4rec_data(X_raw, y_raw, node_map, max_seq_len=10)
+    sequences_all, lengths_all, targets_gru = prepare_gru4rec_data(X_raw, y_raw, node_map, service_map, max_seq_len=10)
     
-    # Split для GRU4Rec (используем те же индексы что и для других моделей)
-    train_indices = []
-    test_indices = []
-    
-    # Создаем индексы для split на основе y
-    for i, (x_raw_item, y_item) in enumerate(zip(X_raw, y_raw)):
-        # Проверяем принадлежность к train или test через y_raw
-        y_encoded = le.transform([y_item])[0]
-        if y_encoded in y_train:
-            # Проверяем что этот конкретный пример в train
-            matching_train = []
-            for j, y_tr in enumerate(y_train):
-                if y_tr == y_encoded and j < len(X_train):
-                    matching_train.append(j)
-            if len(matching_train) > 0 and i < len(matching_train) + len(test_indices):
-                train_indices.append(i)
-            else:
-                test_indices.append(i)
-        else:
-            test_indices.append(i)
-    
-    # Используем стратифицированный split на индексах (с проверкой)
-    from sklearn.model_selection import train_test_split as split_indices
+    # Split для Sequential моделей
     targets_gru_counts = Counter(targets_gru.numpy())
     min_samples_gru = min(targets_gru_counts.values())
     
     if min_samples_gru >= 2:
-        train_idx, test_idx = train_test_split(
-            range(len(sequences_all)), 
+        sequences_train, sequences_test, lengths_train, lengths_test, targets_gru_train, targets_gru_test = train_test_split(
+            sequences_all, lengths_all, targets_gru,
             test_size=args.test_size, 
             random_state=args.random_seed,
             stratify=targets_gru.numpy()
         )
     else:
-        logger.warning(f"Too few samples for stratification in GRU data (min={min_samples_gru}). Using random split.")
-        train_idx, test_idx = train_test_split(
-            range(len(sequences_all)), 
+        logger.warning(f"Too few samples for stratification in Sequential data (min={min_samples_gru}). Using random split.")
+        sequences_train, sequences_test, lengths_train, lengths_test, targets_gru_train, targets_gru_test = train_test_split(
+            sequences_all, lengths_all, targets_gru,
             test_size=args.test_size, 
             random_state=args.random_seed
         )
     
-    sequences_train = sequences_all[train_idx]
-    lengths_train = lengths_all[train_idx]
-    targets_gru_train = targets_gru[train_idx]
-    
-    sequences_test = sequences_all[test_idx]
-    lengths_test = lengths_all[test_idx]
-    targets_gru_test = targets_gru[test_idx]
-    
-    logger.info(f"GRU4Rec train: {len(sequences_train)}, test: {len(sequences_test)}")
+    logger.info(f"Sequential models train: {len(sequences_train)}, test: {len(sequences_test)}")
     
     # Обучение GRU4Rec
     gru4rec_preds, gru4rec_proba = train_gru4rec(
         sequences_train, lengths_train, targets_gru_train,
         sequences_test, lengths_test, targets_gru_test,
-        num_items=len(node_map),
+        num_items=len(node_map) + 1,  # +1 для эмбеддингов (включая padding_idx=0)
+        num_classes=len(service_map),  # Предсказываем только сервисы
         epochs=args.epochs,
         embedding_dim=64,
         hidden_size=args.hidden_channels * 2,  # Больше для RNN
@@ -1190,7 +1844,8 @@ def main():
     logger.info(f"Training SASRec with seed={args.random_seed + 5}...")
     sasrec_preds, sasrec_proba = train_sasrec(
         sequences_train, targets_gru_train, sequences_test, targets_gru_test,
-        num_items=len(node_map),
+        num_items=len(node_map) + 1,  # +1 для эмбеддингов (включая padding_idx=0)
+        num_classes=len(service_map),  # Предсказываем только сервисы
         epochs=args.epochs,
         hidden_size=args.hidden_channels,
         num_heads=2,
@@ -1207,7 +1862,8 @@ def main():
     logger.info(f"Training Caser with seed={args.random_seed + 6}...")
     caser_preds, caser_proba = train_caser(
         sequences_train, targets_gru_train, sequences_test, targets_gru_test,
-        num_items=len(node_map),
+        num_items=len(node_map) + 1,  # +1 для эмбеддингов (включая padding_idx=0)
+        num_classes=len(service_map),  # Предсказываем только сервисы
         epochs=args.epochs,
         embedding_dim=64,
         num_h_filters=16,
@@ -1218,6 +1874,46 @@ def main():
     )
     results['Caser'] = evaluate_model_with_ndcg(
         caser_preds, targets_gru_test.numpy(), proba_preds=caser_proba, name="Caser"
+    )
+
+    # DAGNNSequential - Гибридная модель (DAGNN + GRU)
+    logger.info(f"\nTraining DAGNNSequential (HYBRID: Graph + Sequence) with seed={args.random_seed + 7}...")
+    dagnn_seq_preds, dagnn_seq_proba = train_dagnn_sequential(
+        data_pyg,
+        sequences_train, lengths_train, targets_gru_train,
+        sequences_test, lengths_test, targets_gru_test,
+        hidden_channels=args.hidden_channels,
+        epochs=args.epochs,
+        K=10,
+        num_gru_layers=2,
+        dropout=args.dropout,
+        lr=args.learning_rate,
+        model_seed=args.random_seed + 7,
+        num_service_classes=len(service_map)  # Предсказываем только сервисы
+    )
+    results['DAGNNSequential (DAGNN+GRU)'] = evaluate_model_with_ndcg(
+        dagnn_seq_preds, targets_gru_test.numpy(), proba_preds=dagnn_seq_proba, 
+        name="DAGNNSequential (DAGNN+GRU)"
+    )
+
+    # DAGNNAttention - Гибридная модель (DAGNN + Attention)
+    logger.info(f"\nTraining DAGNNAttention (HYBRID: Graph + Attention) with seed={args.random_seed + 8}...")
+    dagnn_att_preds, dagnn_att_proba = train_dagnn_attention(
+        data_pyg,
+        sequences_train, targets_gru_train,
+        sequences_test, targets_gru_test,
+        hidden_channels=args.hidden_channels,
+        epochs=args.epochs,
+        K=10,
+        num_heads=4,
+        dropout=args.dropout,
+        lr=args.learning_rate,
+        model_seed=args.random_seed + 8,
+        num_service_classes=len(service_map)  # Предсказываем только сервисы
+    )
+    results['DAGNNAttention (DAGNN+Attn)'] = evaluate_model_with_ndcg(
+        dagnn_att_preds, targets_gru_test.numpy(), proba_preds=dagnn_att_proba, 
+        name="DAGNNAttention (DAGNN+Attention)"
     )
 
     # Summary
