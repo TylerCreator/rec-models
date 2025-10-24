@@ -36,7 +36,7 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelBinarizer, LabelEncoder, MultiLabelBinarizer, StandardScaler
+from sklearn.preprocessing import LabelBinarizer, LabelEncoder, MultiLabelBinarizer, StandardScaler, MinMaxScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import APPNP, GATConv, GCNConv, SAGEConv, GATv2Conv, BatchNorm, LayerNorm
 from tqdm import tqdm
@@ -371,22 +371,50 @@ class GRU4Rec(nn.Module):
 
 # ==================== Графовые метрики ====================
 
+def build_graph_from_real_paths(paths: List[List[str]]) -> nx.DiGraph:
+    """
+    Строит граф на основе ТОЛЬКО реальных путей из композиций
+    """
+    logger.info("Building graph from real paths...")
+    
+    path_graph = nx.DiGraph()
+    
+    for path in paths:
+        for i in range(len(path) - 1):
+            source = path[i]
+            target = path[i + 1]
+            
+            source_type = 'service' if source.startswith('service') else 'table'
+            target_type = 'service' if target.startswith('service') else 'table'
+            
+            path_graph.add_node(source, type=source_type)
+            path_graph.add_node(target, type=target_type)
+            path_graph.add_edge(source, target)
+    
+    logger.info(f"Built graph from paths: {path_graph.number_of_nodes()} nodes, "
+                f"{path_graph.number_of_edges()} edges")
+    
+    return path_graph
+
+
 def extract_graph_features(dag: nx.DiGraph) -> Dict[str, Dict[str, float]]:
     """
     Извлекает графовые метрики для каждого узла
     
+    ВАЖНО: dag должен быть построен из реальных путей, а не объединенный граф!
+    
     Метрики:
-    - in_degree: количество входящих связей
-    - out_degree: количество исходящих связей
-    - pagerank: важность узла (вероятность посещения при случайном блуждании)
-    - betweenness: насколько узел является "мостом" между другими узлами
-    - closeness: близость к другим узлам (обратная средняя длина пути)
-    - clustering: плотность связей между соседями узла
+    - in_degree: количество входящих связей (из реальных путей)
+    - out_degree: количество исходящих связей (из реальных путей)
+    - pagerank: важность узла в реальных путях
+    - betweenness: насколько узел является "мостом" в реальных путях
+    - closeness: близость к другим узлам в реальных путях
+    - clustering: плотность связей в реальных путях
     
     Returns:
         Dict[node_name, Dict[metric_name, value]]
     """
-    logger.info("Extracting graph features...")
+    logger.info("Extracting graph features from REAL PATHS...")
     
     features = {}
     
@@ -493,7 +521,7 @@ def extract_paths_from_compositions(data: List) -> List[List[str]]:
         data: исходные данные из compositionsDAG.json
     
     Returns:
-        List of real paths from compositions
+        List of unique real paths from compositions
     """
     logger.info("Extracting REAL paths from compositions (not synthetic DFS paths)")
     
@@ -551,50 +579,66 @@ def extract_paths_from_compositions(data: List) -> List[List[str]]:
 
 
 def create_training_data(paths: List[List[str]]) -> Tuple[List, List]:
+    """
+    Создает обучающие примеры из путей
+    
+    Логика:
+    - Для каждого пути используем ВСЕ переходы
+    - Исключаем только переходы на таблицы (они стартовые, на них нельзя переходить)
+    - Используем пути любой длины (включая длину 2)
+    """
     X_raw = []
     y_raw = []
 
     for path in paths:
-        for i in range(1, len(path) - 1):
+        # Используем все переходы от позиции 1 до конца (включая последний)
+        for i in range(1, len(path)):
             context = tuple(path[:i])
             next_step = path[i]
+            
+            # Исключаем только переходы на таблицы (они стартовые)
             if next_step.startswith("service"):
                 X_raw.append(context)
                 y_raw.append(next_step)
 
-    logger.info(f"Created {len(X_raw)} training samples")
+    logger.info(f"Created {len(X_raw)} training samples from {len(paths)} paths")
     return X_raw, y_raw
 
 
-def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, 
+def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, paths: List[List[str]],
                                    use_graph_features: bool = True) -> Tuple[Data, torch.Tensor, torch.Tensor, Dict]:
     """
     Подготовка данных для PyTorch Geometric с графовыми метриками
     
     Args:
-        dag: Граф
+        dag: Граф (для типов узлов, может быть объединенный)
         X_raw: Контексты
         y_raw: Целевые узлы
+        paths: Реальные пути из композиций
         use_graph_features: Использовать ли графовые метрики (True) или только тип узла (False)
     """
     logger.info("Preparing PyTorch Geometric data with graph features...")
     
-    node_list = list(dag.nodes)
+    # Строим граф на основе ТОЛЬКО реальных путей
+    path_graph = build_graph_from_real_paths(paths)
+    
+    # Используем узлы и ребра из графа реальных путей
+    node_list = list(path_graph.nodes)
     node_encoder = LabelEncoder()
     node_ids = node_encoder.fit_transform(node_list)
     node_map = {node: idx for node, idx in zip(node_list, node_ids)}
 
-    edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in dag.edges], dtype=torch.long).t()
+    edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in path_graph.edges], dtype=torch.long).t()
     
     if use_graph_features:
-        # Извлекаем графовые метрики
-        graph_features = extract_graph_features(dag)
+        # Извлекаем графовые метрики из графа реальных путей
+        graph_features = extract_graph_features(path_graph)
         
         # Создаем расширенный feature vector для каждого узла
         # [is_service, is_table, in_degree, out_degree, pagerank, betweenness, closeness, clustering]
         features = []
         for node in node_list:
-            node_type = dag.nodes[node]['type']
+            node_type = path_graph.nodes[node]['type']
             is_service = 1.0 if node_type == 'service' else 0.0
             is_table = 1.0 if node_type == 'table' else 0.0
             
@@ -614,7 +658,7 @@ def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List,
         features_array = np.array(features, dtype=np.float32)
         
         # Нормализация графовых метрик (кроме one-hot признаков типа)
-        scaler = StandardScaler()
+        scaler = MinMaxScaler(feature_range=(0, 1))
         features_array[:, 2:] = scaler.fit_transform(features_array[:, 2:])
         
         x = torch.tensor(features_array, dtype=torch.float)
@@ -623,10 +667,10 @@ def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List,
         logger.info(f"Feature dimensions: [is_service, is_table, in_degree, out_degree, "
                    f"pagerank, betweenness, closeness, clustering]")
     else:
-        # Старый вариант - только тип узла
-        features = [[1, 0] if dag.nodes[n]['type'] == 'service' else [0, 1] for n in node_list]
+        # Старый вариант - только тип узла (из графа реальных путей)
+        features = [[1, 0] if path_graph.nodes[n]['type'] == 'service' else [0, 1] for n in node_list]
         x = torch.tensor(features, dtype=torch.float)
-        logger.info(f"Created node features with shape: {x.shape} (only node type)")
+        logger.info(f"Created node features with shape: {x.shape} (only node type from real paths)")
     
     data_pyg = Data(x=x, edge_index=edge_index)
 
@@ -973,7 +1017,7 @@ def main():
     logger.info(f"{'='*70}\n")
     
     data_pyg, contexts, targets, node_map = prepare_pytorch_geometric_data(
-        dag, X_raw, y_raw, use_graph_features=use_graph_features
+        dag, X_raw, y_raw, paths, use_graph_features=use_graph_features
     )
     
     # Определяем количество входных каналов
@@ -1040,12 +1084,16 @@ def main():
         gcn_preds, targets_test.numpy(), proba_preds=gcn_proba, name="GCN"
     )
 
-    # DAGNN
+    # DAGNN (для сравнения - демонстрирует несовместимость с графовыми метриками на малых данных)
+    # ПРИМЕЧАНИЕ: DAGNN переобучается на графовых метриках независимо от параметров
+    # Причина: APPNP архитектура слишком чувствительна к дополнительным признакам при малом объеме данных
     logger.info(f"Training DAGNN with seed={args.random_seed + 2}...")
     torch.manual_seed(args.random_seed + 2)
     dagnn = DAGNNRecommender(
-        in_channels=in_channels, hidden_channels=args.hidden_channels,
-        out_channels=len(node_map), dropout=0.4
+        in_channels=in_channels, 
+        hidden_channels=args.hidden_channels,
+        out_channels=len(node_map), 
+        dropout=0.4
     )
     opt_dagnn = torch.optim.Adam(dagnn.parameters(), lr=args.learning_rate * 0.8, weight_decay=1e-4)
     sched_dagnn = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_dagnn, mode='min', factor=0.5, patience=20)

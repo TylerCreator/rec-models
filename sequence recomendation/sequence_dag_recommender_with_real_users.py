@@ -35,7 +35,7 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelBinarizer, LabelEncoder, StandardScaler
+from sklearn.preprocessing import LabelBinarizer, LabelEncoder
 from torch_geometric.data import Data
 from torch_geometric.nn import APPNP, LayerNorm
 from tqdm import tqdm
@@ -375,15 +375,23 @@ def create_training_data_with_users(
 ) -> Tuple[List, List, List]:
     """
     Создает обучающие данные с реальными user IDs
+    
+    Логика:
+    - Для каждого пути используем ВСЕ переходы
+    - Исключаем только переходы на таблицы (они стартовые, на них нельзя переходить)
+    - Используем пути любой длины (включая длину 2)
     """
     X_raw = []
     y_raw = []
     user_ids_raw = []
 
     for path in paths:
-        for i in range(1, len(path) - 1):
+        # Используем все переходы от позиции 1 до конца (включая последний)
+        for i in range(1, len(path)):
             context = tuple(path[:i])
             next_step = path[i]
+            
+            # Исключаем только переходы на таблицы (они стартовые)
             if next_step.startswith("service"):
                 # Определяем owner для этой последовательности
                 # Берем owner целевого сервиса
@@ -393,7 +401,7 @@ def create_training_data_with_users(
                 y_raw.append(next_step)
                 user_ids_raw.append(owner)
 
-    logger.info(f"Created {len(X_raw)} training samples with real users")
+    logger.info(f"Created {len(X_raw)} training samples with real users from {len(paths)} paths")
     
     # Статистика по пользователям
     user_counter = Counter(user_ids_raw)
@@ -406,9 +414,39 @@ def create_training_data_with_users(
     return X_raw, y_raw, user_ids_raw
 
 
+def build_graph_from_real_paths(paths: List[List[str]]) -> nx.DiGraph:
+    """
+    Строит граф на основе ТОЛЬКО реальных путей из композиций
+    """
+    logger.info("Building graph from real paths...")
+    
+    path_graph = nx.DiGraph()
+    
+    for path in paths:
+        for i in range(len(path) - 1):
+            source = path[i]
+            target = path[i + 1]
+            
+            source_type = 'service' if source.startswith('service') else 'table'
+            target_type = 'service' if target.startswith('service') else 'table'
+            
+            path_graph.add_node(source, type=source_type)
+            path_graph.add_node(target, type=target_type)
+            path_graph.add_edge(source, target)
+    
+    logger.info(f"Built graph from paths: {path_graph.number_of_nodes()} nodes, "
+                f"{path_graph.number_of_edges()} edges")
+    
+    return path_graph
+
+
 def extract_graph_features(dag: nx.DiGraph) -> Dict[str, Dict[str, float]]:
-    """Извлекает графовые метрики"""
-    logger.info("Extracting graph features...")
+    """
+    Извлекает графовые метрики из графа реальных путей
+    
+    ВАЖНО: dag должен быть построен из реальных путей!
+    """
+    logger.info("Extracting graph features from REAL PATHS...")
     
     features = {}
     
@@ -508,51 +546,40 @@ def compute_personalized_pagerank(
 
 
 def prepare_pytorch_geometric_data_with_real_users(
-    dag: nx.DiGraph, X_raw: List, y_raw: List, user_ids_raw: List
+    dag: nx.DiGraph, X_raw: List, y_raw: List, user_ids_raw: List, paths: List[List[str]]
 ) -> Tuple[Data, torch.Tensor, torch.Tensor, torch.Tensor, Dict, Dict]:
     """
     Подготовка данных с реальными пользователями
+    Используются только базовые признаки (is_service, is_table) без графовых метрик
     """
-    logger.info("Preparing PyTorch Geometric data with real users...")
+    logger.info("Preparing PyTorch Geometric data with real users (base features only)...")
     
-    node_list = list(dag.nodes)
+    # Строим граф на основе ТОЛЬКО реальных путей
+    path_graph = build_graph_from_real_paths(paths)
+    
+    # Используем узлы и ребра из графа реальных путей
+    node_list = list(path_graph.nodes)
     node_encoder = LabelEncoder()
     node_ids = node_encoder.fit_transform(node_list)
     node_map = {node: idx for node, idx in zip(node_list, node_ids)}
 
-    edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in dag.edges], dtype=torch.long).t()
+    edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in path_graph.edges], dtype=torch.long).t()
     
-    # Извлекаем графовые метрики
-    graph_features = extract_graph_features(dag)
-    
-    # Создаем feature matrix
+    # Создаем feature matrix - ТОЛЬКО базовые признаки (is_service, is_table)
     features = []
     for node in node_list:
-        node_type = dag.nodes[node]['type']
+        node_type = path_graph.nodes[node]['type']
         is_service = 1.0 if node_type == 'service' else 0.0
         is_table = 1.0 if node_type == 'table' else 0.0
         
-        gf = graph_features[node]
-        feature_vector = [
-            is_service,
-            is_table,
-            gf['in_degree'],
-            gf['out_degree'],
-            gf['pagerank'],
-            gf['betweenness'],
-            gf['closeness'],
-            gf['clustering']
-        ]
+        feature_vector = [is_service, is_table]
         features.append(feature_vector)
     
-    features_array = np.array(features, dtype=np.float32)
-    
-    # Нормализация графовых метрик
-    scaler = StandardScaler()
-    features_array[:, 2:] = scaler.fit_transform(features_array[:, 2:])
-    
-    x = torch.tensor(features_array, dtype=torch.float)
+    x = torch.tensor(features, dtype=torch.float)
     data_pyg = Data(x=x, edge_index=edge_index)
+    
+    logger.info(f"Created node features with shape: {x.shape}")
+    logger.info(f"Feature dimensions: [is_service, is_table] (base features only, no graph metrics)")
 
     contexts = torch.tensor([node_map[context[-1]] for context in X_raw], dtype=torch.long)
     targets = torch.tensor([node_map[y] for y in y_raw], dtype=torch.long)
@@ -676,7 +703,7 @@ def main():
 
     # Prepare data
     data_pyg, contexts, targets, user_ids_tensor, node_map, user_encoder = \
-        prepare_pytorch_geometric_data_with_real_users(dag, X_raw, y_raw, user_ids_raw)
+        prepare_pytorch_geometric_data_with_real_users(dag, X_raw, y_raw, user_ids_raw, paths)
     
     # Split data (с проверкой возможности стратификации)
     target_counts = Counter(targets.numpy())

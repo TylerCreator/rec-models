@@ -499,7 +499,7 @@ def extract_paths_from_compositions(data: List) -> List[List[str]]:
         data: исходные данные из compositionsDAG.json
     
     Returns:
-        List of real paths from compositions
+        List of unique real paths from compositions
     """
     logger.info("Extracting REAL paths from compositions (not synthetic DFS paths)")
     
@@ -556,32 +556,76 @@ def extract_paths_from_compositions(data: List) -> List[List[str]]:
     return unique_paths
 
 
+def build_graph_from_real_paths(paths: List[List[str]]) -> nx.DiGraph:
+    """
+    Строит граф на основе ТОЛЬКО реальных путей из композиций
+    """
+    logger.info("Building graph from real paths...")
+    
+    path_graph = nx.DiGraph()
+    
+    for path in paths:
+        for i in range(len(path) - 1):
+            source = path[i]
+            target = path[i + 1]
+            
+            source_type = 'service' if source.startswith('service') else 'table'
+            target_type = 'service' if target.startswith('service') else 'table'
+            
+            path_graph.add_node(source, type=source_type)
+            path_graph.add_node(target, type=target_type)
+            path_graph.add_edge(source, target)
+    
+    logger.info(f"Built graph from paths: {path_graph.number_of_nodes()} nodes, "
+                f"{path_graph.number_of_edges()} edges")
+    
+    return path_graph
+
+
 def create_training_data(paths: List[List[str]]) -> Tuple[List, List]:
+    """
+    Создает обучающие примеры из путей
+    
+    Логика:
+    - Для каждого пути используем ВСЕ переходы
+    - Исключаем только переходы на таблицы (они стартовые, на них нельзя переходить)
+    - Используем пути любой длины (включая длину 2)
+    """
     X_raw = []
     y_raw = []
 
     for path in paths:
-        for i in range(1, len(path) - 1):
+        # Используем все переходы от позиции 1 до конца (включая последний)
+        for i in range(1, len(path)):
             context = tuple(path[:i])
             next_step = path[i]
+            
+            # Исключаем только переходы на таблицы (они стартовые)
             if next_step.startswith("service"):
                 X_raw.append(context)
                 y_raw.append(next_step)
 
-    logger.info(f"Created {len(X_raw)} training samples")
+    logger.info(f"Created {len(X_raw)} training samples from {len(paths)} paths")
     return X_raw, y_raw
 
 
-def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List) -> Tuple[Data, torch.Tensor, torch.Tensor, Dict]:
-    logger.info("Preparing PyTorch Geometric data")
+def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, paths: List[List[str]]) -> Tuple[Data, torch.Tensor, torch.Tensor, Dict]:
+    """
+    Подготовка данных для PyTorch Geometric
+    Граф строится из РЕАЛЬНЫХ путей
+    """
+    logger.info("Preparing PyTorch Geometric data from real paths...")
     
-    node_list = list(dag.nodes)
+    # Строим граф на основе реальных путей
+    path_graph = build_graph_from_real_paths(paths)
+    
+    node_list = list(path_graph.nodes)
     node_encoder = LabelEncoder()
     node_ids = node_encoder.fit_transform(node_list)
     node_map = {node: idx for node, idx in zip(node_list, node_ids)}
 
-    edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in dag.edges], dtype=torch.long).t()
-    features = [[1, 0] if dag.nodes[n]['type'] == 'service' else [0, 1] for n in node_list]
+    edge_index = torch.tensor([[node_map[u], node_map[v]] for u, v in path_graph.edges], dtype=torch.long).t()
+    features = [[1, 0] if path_graph.nodes[n]['type'] == 'service' else [0, 1] for n in node_list]
     x = torch.tensor(features, dtype=torch.float)
     data_pyg = Data(x=x, edge_index=edge_index)
 
@@ -967,8 +1011,8 @@ def main():
     logger.info(f"Train class distribution: {Counter(y_train)}")
     logger.info(f"Test class distribution: {Counter(y_test)}")
 
-    # Prepare PyG data
-    data_pyg, contexts, targets, node_map = prepare_pytorch_geometric_data(dag, X_raw, y_raw)
+    # Prepare PyG data from real paths
+    data_pyg, contexts, targets, node_map = prepare_pytorch_geometric_data(dag, X_raw, y_raw, paths)
     
     # Стратифицированный split для графовых моделей (с проверкой)
     target_counts_graph = Counter(targets.numpy())
