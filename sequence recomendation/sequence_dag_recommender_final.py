@@ -1056,14 +1056,16 @@ def main():
         pop_preds, y_test, proba_preds=pop_proba, name="Popularity"
     )
 
-    # GCN - с уникальным seed
+    # GCN - с уникальным seed (улучшенные параметры)
     logger.info(f"Training GCN with seed={args.random_seed + 1}...")
     torch.manual_seed(args.random_seed + 1)
     gcn = GCNRecommender(
-        in_channels=2, hidden_channels=args.hidden_channels,
-        out_channels=len(node_map), dropout=0.5  # Увеличенный dropout
+        in_channels=2, 
+        hidden_channels=args.hidden_channels * 2,  # Больше capacity
+        out_channels=len(node_map), 
+        dropout=0.3  # Меньше dropout для лучшего обучения
     )
-    opt_gcn = torch.optim.Adam(gcn.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    opt_gcn = torch.optim.Adam(gcn.parameters(), lr=args.learning_rate * 1.5, weight_decay=5e-5)
     sched_gcn = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_gcn, mode='min', factor=0.5, patience=20)
     
     gcn_preds, gcn_proba = train_model_generic(
