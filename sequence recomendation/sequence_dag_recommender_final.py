@@ -9,6 +9,34 @@
 3. Более агрессивная регуляризация
 4. Детальное логирование предсказаний
 5. Cross-validation для проверки
+
+КРОСС-ВАЛИДАЦИЯ:
+Файл поддерживает два режима работы:
+
+1. СТАНДАРТНЫЙ РЕЖИМ (train/test split):
+   python sequence_dag_recommender_final.py --data compositionsDAG.json
+
+2. РЕЖИМ КРОСС-ВАЛИДАЦИИ (k-fold CV):
+   python sequence_dag_recommender_final.py --data compositionsDAG.json --use-cv --cv-folds 5
+   
+   Параметры кросс-валидации:
+   --use-cv         : Включить режим кросс-валидации
+   --cv-folds N     : Количество фолдов (по умолчанию: 5)
+   
+   В режиме кросс-валидации все модели тренируются на каждом фолде,
+   и в конце выводятся агрегированные метрики (среднее ± стандартное отклонение).
+
+Модели для сравнения:
+- Popularity (baseline)
+- GCN
+- DAGNN
+- DAGNN-Improved (с Focal Loss + Label Smoothing)
+- GraphSAGE
+- GRU4Rec
+- SASRec
+- Caser
+- DAGNNSequential (DAGNN + GRU)
+- DAGNNAttention (DAGNN + Attention)
 """
 
 import argparse
@@ -892,6 +920,36 @@ def create_training_data(paths: List[List[str]]) -> Tuple[List, List]:
     return X_raw, y_raw
 
 
+def contexts_to_features(contexts_tensor, node_map, mlb):
+    """
+    Преобразует тензор контекстов (node indices) в feature vectors для RandomForest
+    
+    Args:
+        contexts_tensor: torch.Tensor с индексами узлов
+        node_map: dict отображение node_name -> node_idx
+        mlb: MultiLabelBinarizer для кодирования
+    
+    Returns:
+        np.ndarray: матрица признаков
+    """
+    # Обратное отображение: idx -> node_name
+    idx_to_node = {idx: name for name, idx in node_map.items()}
+    
+    # Преобразуем contexts_tensor в списки имен узлов
+    contexts_as_names = []
+    for context_tensor in contexts_tensor:
+        # Берем только не-padding элементы (предполагаем что padding = 0 или -1)
+        context_names = []
+        for idx in context_tensor.tolist():
+            if idx > 0 and idx in idx_to_node:  # Пропускаем padding
+                context_names.append(idx_to_node[idx])
+        contexts_as_names.append(tuple(context_names) if context_names else ('',))
+    
+    # Используем MultiLabelBinarizer для преобразования в features
+    X_features = mlb.transform(contexts_as_names)
+    return X_features
+
+
 def prepare_pytorch_geometric_data(dag: nx.DiGraph, X_raw: List, y_raw: List, paths: List[List[str]]) -> Tuple[Data, torch.Tensor, torch.Tensor, Dict, Dict]:
     """
     Подготовка данных для PyTorch Geometric
@@ -1580,6 +1638,419 @@ def train_gru4rec(
     return preds, proba
 
 
+# ==================== Кросс-валидация ====================
+
+def cross_validate_models(
+    data_pyg, contexts, targets, sequences_all, lengths_all, 
+    node_map, service_map, mlb, args, n_splits=5
+):
+    """
+    Универсальная функция кросс-валидации для всех моделей
+    
+    Args:
+        data_pyg: PyG graph data
+        contexts: Context node indices
+        targets: Target service indices
+        sequences_all: Sequences for sequential models
+        lengths_all: Sequence lengths
+        node_map: Node to index mapping
+        service_map: Service to index mapping
+        mlb: MultiLabelBinarizer for feature encoding
+        args: Command line arguments
+        n_splits: Number of CV folds
+    
+    Returns:
+        Dictionary with aggregated results for all models
+    """
+    logger.info(f"\n{'='*70}")
+    logger.info(f"🔄 STARTING {n_splits}-FOLD CROSS-VALIDATION FOR ALL MODELS")
+    logger.info(f"{'='*70}\n")
+    
+    # Инициализируем словарь для хранения результатов каждой модели по всем фолдам
+    all_fold_results = {
+        'Popularity': [],
+        'Random Forest': [],
+        'GCN': [],
+        'DAGNN': [],
+        'DAGNN-Improved (Focal)': [],
+        'GraphSAGE': [],
+        'GRU4Rec': [],
+        'SASRec': [],
+        'Caser': [],
+        'DAGNNSequential (DAGNN+GRU)': [],
+        'DAGNNAttention (DAGNN+Attn)': []
+    }
+    
+    # StratifiedKFold для обеспечения одинакового распределения классов
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=args.random_seed)
+    
+    # Кросс-валидация
+    fold_idx = 1
+    for train_idx, test_idx in skf.split(contexts, targets):
+        logger.info(f"\n{'='*70}")
+        logger.info(f"📊 FOLD {fold_idx}/{n_splits}")
+        logger.info(f"{'='*70}\n")
+        
+        # Split для графовых моделей
+        contexts_train = contexts[train_idx]
+        contexts_test = contexts[test_idx]
+        targets_train = targets[train_idx]
+        targets_test = targets[test_idx]
+        
+        # Split для sequential моделей
+        sequences_train = sequences_all[train_idx]
+        sequences_test = sequences_all[test_idx]
+        lengths_train = lengths_all[train_idx]
+        lengths_test = lengths_all[test_idx]
+        
+        logger.info(f"Fold {fold_idx}: Train samples = {len(train_idx)}, Test samples = {len(test_idx)}")
+        logger.info(f"Train class distribution: {Counter(targets_train.numpy())}")
+        logger.info(f"Test class distribution: {Counter(targets_test.numpy())}")
+        
+        # 1. Popularity baseline
+        logger.info(f"\n[Fold {fold_idx}] Training Popularity baseline...")
+        counter = Counter(targets_train.numpy())
+        top_label = counter.most_common(1)[0][0]
+        pop_preds = np.array([top_label] * len(targets_test))
+        pop_proba = np.zeros((len(targets_test), len(service_map)))
+        pop_proba[:, top_label] = 1
+        fold_metrics = evaluate_model_with_ndcg(
+            pop_preds, targets_test.numpy(), proba_preds=pop_proba, 
+            name=f"Popularity (Fold {fold_idx})"
+        )
+        all_fold_results['Popularity'].append(fold_metrics)
+        
+        # 2. Random Forest
+        logger.info(f"\n[Fold {fold_idx}] Training Random Forest...")
+        # Преобразуем contexts в features для RandomForest
+        X_train_rf = contexts_to_features(contexts_train, node_map, mlb)
+        X_test_rf = contexts_to_features(contexts_test, node_map, mlb)
+        
+        np.random.seed(args.random_seed + fold_idx * 10)
+        rf = RandomForestClassifier(
+            n_estimators=200, 
+            max_depth=15, 
+            min_samples_split=5,
+            random_state=args.random_seed + fold_idx * 10, 
+            n_jobs=-1
+        )
+        rf.fit(X_train_rf, targets_train.numpy())
+        rf_preds = rf.predict(X_test_rf)
+        rf_proba = rf.predict_proba(X_test_rf)
+        fold_metrics = evaluate_model_with_ndcg(
+            rf_preds, targets_test.numpy(), proba_preds=rf_proba, 
+            name=f"Random Forest (Fold {fold_idx})"
+        )
+        all_fold_results['Random Forest'].append(fold_metrics)
+        
+        # 3. GCN
+        logger.info(f"\n[Fold {fold_idx}] Training GCN...")
+        torch.manual_seed(args.random_seed + fold_idx * 10 + 1)
+        gcn = GCNRecommender(
+            in_channels=2, 
+            hidden_channels=args.hidden_channels * 2,
+            out_channels=len(service_map),
+            dropout=0.3
+        )
+        opt_gcn = torch.optim.Adam(gcn.parameters(), lr=args.learning_rate * 1.5, weight_decay=5e-5)
+        sched_gcn = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_gcn, mode='min', factor=0.5, patience=20)
+        
+        gcn_preds, gcn_proba = train_model_generic(
+            gcn, data_pyg, contexts_train, targets_train, contexts_test, targets_test,
+            opt_gcn, sched_gcn, args.epochs, f"GCN", args.random_seed + fold_idx * 10 + 1
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            gcn_preds, targets_test.numpy(), proba_preds=gcn_proba, 
+            name=f"GCN (Fold {fold_idx})"
+        )
+        all_fold_results['GCN'].append(fold_metrics)
+        
+        # 4. DAGNN
+        logger.info(f"\n[Fold {fold_idx}] Training DAGNN...")
+        torch.manual_seed(args.random_seed + fold_idx * 10 + 2)
+        dagnn = DAGNNRecommender(
+            in_channels=2, 
+            hidden_channels=args.hidden_channels,
+            out_channels=len(service_map), 
+            dropout=0.4
+        )
+        opt_dagnn = torch.optim.Adam(dagnn.parameters(), lr=args.learning_rate * 0.8, weight_decay=1e-4)
+        sched_dagnn = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_dagnn, mode='min', factor=0.5, patience=20)
+        
+        dagnn_preds, dagnn_proba = train_model_generic(
+            dagnn, data_pyg, contexts_train, targets_train, contexts_test, targets_test,
+            opt_dagnn, sched_dagnn, args.epochs, f"DAGNN", args.random_seed + fold_idx * 10 + 2
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            dagnn_preds, targets_test.numpy(), proba_preds=dagnn_proba, 
+            name=f"DAGNN (Fold {fold_idx})"
+        )
+        all_fold_results['DAGNN'].append(fold_metrics)
+        
+        # 5. DAGNN-Improved (с Focal Loss)
+        logger.info(f"\n[Fold {fold_idx}] Training DAGNN-Improved (Focal Loss)...")
+        
+        # Веса классов для текущего фолда
+        train_class_counts = Counter(targets_train.numpy())
+        total_samples = sum(train_class_counts.values())
+        num_all_classes = len(service_map)
+        
+        class_weights = []
+        for i in range(num_all_classes):
+            count = train_class_counts.get(i, 1)
+            if count > 0:
+                weight = total_samples / (len(train_class_counts) * count)
+            else:
+                weight = 1.0
+            class_weights.append(weight)
+        
+        torch.manual_seed(args.random_seed + fold_idx * 10 + 20)
+        dagnn_improved = DAGNNRecommender(
+            in_channels=2, 
+            hidden_channels=args.hidden_channels * 2,
+            out_channels=len(service_map),
+            K=15,
+            dropout=0.5
+        )
+        opt_dagnn_improved = torch.optim.Adam(
+            dagnn_improved.parameters(), 
+            lr=args.learning_rate * 0.5,
+            weight_decay=5e-4
+        )
+        sched_dagnn_improved = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt_dagnn_improved, mode='min', factor=0.5, patience=25
+        )
+        
+        dagnn_improved_preds, dagnn_improved_proba = train_model_with_focal_loss(
+            dagnn_improved, data_pyg, 
+            contexts_train, targets_train, 
+            contexts_test, targets_test,
+            opt_dagnn_improved, sched_dagnn_improved, args.epochs, 
+            f"DAGNN-Improved", args.random_seed + fold_idx * 10 + 20,
+            class_weights=class_weights,
+            use_label_smoothing=True
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            dagnn_improved_preds, targets_test.numpy(), 
+            proba_preds=dagnn_improved_proba, 
+            name=f"DAGNN-Improved (Fold {fold_idx})"
+        )
+        all_fold_results['DAGNN-Improved (Focal)'].append(fold_metrics)
+        
+        # 6. GraphSAGE
+        logger.info(f"\n[Fold {fold_idx}] Training GraphSAGE...")
+        torch.manual_seed(args.random_seed + fold_idx * 10 + 3)
+        sage = GraphSAGERecommender(
+            in_channels=2, 
+            hidden_channels=args.hidden_channels,
+            out_channels=len(service_map), 
+            dropout=0.4
+        )
+        opt_sage = torch.optim.Adam(sage.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+        sched_sage = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_sage, mode='min', factor=0.5, patience=20)
+        
+        sage_preds, sage_proba = train_model_generic(
+            sage, data_pyg, contexts_train, targets_train, contexts_test, targets_test,
+            opt_sage, sched_sage, args.epochs, f"GraphSAGE", args.random_seed + fold_idx * 10 + 3
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            sage_preds, targets_test.numpy(), proba_preds=sage_proba, 
+            name=f"GraphSAGE (Fold {fold_idx})"
+        )
+        all_fold_results['GraphSAGE'].append(fold_metrics)
+        
+        # 7. GRU4Rec
+        logger.info(f"\n[Fold {fold_idx}] Training GRU4Rec...")
+        gru4rec_preds, gru4rec_proba = train_gru4rec(
+            sequences_train, lengths_train, targets_train,
+            sequences_test, lengths_test, targets_test,
+            num_items=len(node_map) + 1,
+            num_classes=len(service_map),
+            epochs=args.epochs,
+            embedding_dim=64,
+            hidden_size=args.hidden_channels * 2,
+            num_layers=2,
+            dropout=args.dropout,
+            lr=args.learning_rate,
+            model_seed=args.random_seed + fold_idx * 10 + 4
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            gru4rec_preds, targets_test.numpy(), proba_preds=gru4rec_proba, 
+            name=f"GRU4Rec (Fold {fold_idx})"
+        )
+        all_fold_results['GRU4Rec'].append(fold_metrics)
+        
+        # 8. SASRec
+        logger.info(f"\n[Fold {fold_idx}] Training SASRec...")
+        sasrec_preds, sasrec_proba = train_sasrec(
+            sequences_train, targets_train, sequences_test, targets_test,
+            num_items=len(node_map) + 1,
+            num_classes=len(service_map),
+            epochs=args.epochs,
+            hidden_size=args.hidden_channels,
+            num_heads=2,
+            num_blocks=2,
+            dropout=args.dropout,
+            lr=args.learning_rate,
+            model_seed=args.random_seed + fold_idx * 10 + 5
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            sasrec_preds, targets_test.numpy(), proba_preds=sasrec_proba, 
+            name=f"SASRec (Fold {fold_idx})"
+        )
+        all_fold_results['SASRec'].append(fold_metrics)
+        
+        # 9. Caser
+        logger.info(f"\n[Fold {fold_idx}] Training Caser...")
+        caser_preds, caser_proba = train_caser(
+            sequences_train, targets_train, sequences_test, targets_test,
+            num_items=len(node_map) + 1,
+            num_classes=len(service_map),
+            epochs=args.epochs,
+            embedding_dim=64,
+            num_h_filters=16,
+            num_v_filters=4,
+            dropout=args.dropout,
+            lr=args.learning_rate,
+            model_seed=args.random_seed + fold_idx * 10 + 6
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            caser_preds, targets_test.numpy(), proba_preds=caser_proba, 
+            name=f"Caser (Fold {fold_idx})"
+        )
+        all_fold_results['Caser'].append(fold_metrics)
+        
+        # 10. DAGNNSequential
+        logger.info(f"\n[Fold {fold_idx}] Training DAGNNSequential (DAGNN+GRU)...")
+        dagnn_seq_preds, dagnn_seq_proba = train_dagnn_sequential(
+            data_pyg,
+            sequences_train, lengths_train, targets_train,
+            sequences_test, lengths_test, targets_test,
+            hidden_channels=args.hidden_channels,
+            epochs=args.epochs,
+            K=10,
+            num_gru_layers=2,
+            dropout=args.dropout,
+            lr=args.learning_rate,
+            model_seed=args.random_seed + fold_idx * 10 + 7,
+            num_service_classes=len(service_map)
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            dagnn_seq_preds, targets_test.numpy(), proba_preds=dagnn_seq_proba, 
+            name=f"DAGNNSequential (Fold {fold_idx})"
+        )
+        all_fold_results['DAGNNSequential (DAGNN+GRU)'].append(fold_metrics)
+        
+        # 11. DAGNNAttention
+        logger.info(f"\n[Fold {fold_idx}] Training DAGNNAttention (DAGNN+Attention)...")
+        dagnn_att_preds, dagnn_att_proba = train_dagnn_attention(
+            data_pyg,
+            sequences_train, targets_train,
+            sequences_test, targets_test,
+            hidden_channels=args.hidden_channels,
+            epochs=args.epochs,
+            K=10,
+            num_heads=4,
+            dropout=args.dropout,
+            lr=args.learning_rate,
+            model_seed=args.random_seed + fold_idx * 10 + 8,
+            num_service_classes=len(service_map)
+        )
+        fold_metrics = evaluate_model_with_ndcg(
+            dagnn_att_preds, targets_test.numpy(), proba_preds=dagnn_att_proba, 
+            name=f"DAGNNAttention (Fold {fold_idx})"
+        )
+        all_fold_results['DAGNNAttention (DAGNN+Attn)'].append(fold_metrics)
+        
+        fold_idx += 1
+    
+    # Агрегируем результаты по всем фолдам
+    logger.info(f"\n{'='*70}")
+    logger.info(f"📊 AGGREGATING RESULTS ACROSS ALL {n_splits} FOLDS")
+    logger.info(f"{'='*70}\n")
+    
+    aggregated_results = {}
+    for model_name, fold_metrics_list in all_fold_results.items():
+        # Вычисляем среднее и стандартное отклонение для каждой метрики
+        metrics_aggregated = {}
+        metric_names = fold_metrics_list[0].keys()
+        
+        for metric_name in metric_names:
+            values = [fm[metric_name] for fm in fold_metrics_list if fm[metric_name] is not None]
+            if values:
+                metrics_aggregated[f'{metric_name}_mean'] = np.mean(values)
+                metrics_aggregated[f'{metric_name}_std'] = np.std(values)
+            else:
+                metrics_aggregated[f'{metric_name}_mean'] = None
+                metrics_aggregated[f'{metric_name}_std'] = None
+        
+        aggregated_results[model_name] = metrics_aggregated
+    
+    return aggregated_results
+
+
+def print_cv_results(aggregated_results):
+    """
+    Выводит результаты кросс-валидации в красивом формате
+    """
+    logger.info("\n" + "="*90)
+    logger.info("🏆 ИТОГОВЫЕ РЕЗУЛЬТАТЫ КРОСС-ВАЛИДАЦИИ (Mean ± Std)")
+    logger.info("="*90)
+    
+    # Сортируем модели по accuracy_mean
+    sorted_results = sorted(
+        aggregated_results.items(), 
+        key=lambda x: x[1]['accuracy_mean'] if x[1]['accuracy_mean'] is not None else 0, 
+        reverse=True
+    )
+    
+    for rank, (model_name, metrics) in enumerate(sorted_results, 1):
+        logger.info(f"\n{'='*90}")
+        logger.info(f"#{rank} {model_name}")
+        logger.info(f"{'='*90}")
+        
+        # Группируем метрики
+        metric_groups = ['accuracy', 'f1', 'precision', 'recall', 'ndcg']
+        
+        for metric_base in metric_groups:
+            mean_key = f'{metric_base}_mean'
+            std_key = f'{metric_base}_std'
+            
+            if mean_key in metrics and metrics[mean_key] is not None:
+                mean_val = metrics[mean_key]
+                std_val = metrics[std_key] if std_key in metrics else 0
+                logger.info(f"  {metric_base:12s}: {mean_val:.4f} ± {std_val:.4f}")
+            elif mean_key in metrics:
+                logger.info(f"  {metric_base:12s}: N/A")
+    
+    # Статистика различий
+    logger.info("\n" + "="*90)
+    logger.info("🔍 СТАТИСТИЧЕСКИЙ АНАЛИЗ")
+    logger.info("="*90)
+    
+    accuracies = [m['accuracy_mean'] for m in aggregated_results.values() 
+                  if m['accuracy_mean'] is not None]
+    
+    logger.info(f"Accuracy - Min:   {min(accuracies):.4f}")
+    logger.info(f"Accuracy - Max:   {max(accuracies):.4f}")
+    logger.info(f"Accuracy - Range: {max(accuracies) - min(accuracies):.4f}")
+    logger.info(f"Accuracy - Mean:  {np.mean(accuracies):.4f}")
+    logger.info(f"Accuracy - Std:   {np.std(accuracies):.4f}")
+    
+    # Лучшие модели
+    logger.info(f"\n🥇 Best Model (Accuracy): {sorted_results[0][0]} "
+                f"({sorted_results[0][1]['accuracy_mean']:.4f} ± {sorted_results[0][1]['accuracy_std']:.4f})")
+    
+    # Проверяем nDCG
+    ndcg_results = [(name, m['ndcg_mean']) for name, m in aggregated_results.items() 
+                    if m.get('ndcg_mean') is not None]
+    if ndcg_results:
+        best_ndcg = max(ndcg_results, key=lambda x: x[1])
+        logger.info(f"🥇 Best Model (nDCG):     {best_ndcg[0]} ({best_ndcg[1]:.4f})")
+    
+    logger.info("="*90)
+
+
 def main():
     parser = argparse.ArgumentParser(description="FINAL DAG-based Recommender with Fixed Results")
     parser.add_argument("--data", type=str, default="compositionsDAG.json")
@@ -1589,6 +2060,10 @@ def main():
     parser.add_argument("--learning-rate", type=float, default=0.001)
     parser.add_argument("--dropout", type=float, default=0.4)
     parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--use-cv", action="store_true", 
+                        help="Use cross-validation instead of single train/test split")
+    parser.add_argument("--cv-folds", type=int, default=5,
+                        help="Number of folds for cross-validation (default: 5)")
     
     args = parser.parse_args()
 
@@ -1670,6 +2145,40 @@ def main():
         )
     logger.info(f"Graph train samples: {len(contexts_train)}, test samples: {len(contexts_test)}")
 
+    # Подготовка данных для Sequential моделей (нужны для обоих режимов)
+    sequences_all, lengths_all, targets_gru = prepare_gru4rec_data(X_raw, y_raw, node_map, service_map, max_seq_len=10)
+    
+    # ВЫБОР РЕЖИМА: Кросс-валидация или простой train/test split
+    if args.use_cv:
+        logger.info(f"\n{'='*70}")
+        logger.info(f"🔄 CROSS-VALIDATION MODE ENABLED ({args.cv_folds} folds)")
+        logger.info(f"{'='*70}\n")
+        
+        # Запускаем кросс-валидацию для всех моделей
+        aggregated_results = cross_validate_models(
+            data_pyg=data_pyg,
+            contexts=contexts,
+            targets=targets,
+            sequences_all=sequences_all,
+            lengths_all=lengths_all,
+            node_map=node_map,
+            service_map=service_map,
+            mlb=mlb,
+            args=args,
+            n_splits=args.cv_folds
+        )
+        
+        # Выводим агрегированные результаты
+        print_cv_results(aggregated_results)
+        
+        # Завершаем программу после кросс-валидации
+        return
+    
+    # СТАНДАРТНЫЙ РЕЖИМ: простой train/test split
+    logger.info(f"\n{'='*70}")
+    logger.info(f"📊 STANDARD TRAIN/TEST SPLIT MODE")
+    logger.info(f"{'='*70}\n")
+    
     results = {}
 
     # Popularity baseline
@@ -1682,6 +2191,27 @@ def main():
     pop_proba[:, top_label_index] = 1
     results['Popularity'] = evaluate_model_with_ndcg(
         pop_preds, y_test, proba_preds=pop_proba, name="Popularity"
+    )
+
+    # Random Forest
+    logger.info("Training Random Forest...")
+    # Преобразуем contexts в features для RandomForest
+    X_train_rf = contexts_to_features(contexts_train, node_map, mlb)
+    X_test_rf = contexts_to_features(contexts_test, node_map, mlb)
+    
+    np.random.seed(args.random_seed)
+    rf = RandomForestClassifier(
+        n_estimators=200, 
+        max_depth=15, 
+        min_samples_split=5,
+        random_state=args.random_seed, 
+        n_jobs=-1
+    )
+    rf.fit(X_train_rf, targets_train.numpy())
+    rf_preds = rf.predict(X_test_rf)
+    rf_proba = rf.predict_proba(X_test_rf)
+    results['Random Forest'] = evaluate_model_with_ndcg(
+        rf_preds, targets_test.numpy(), proba_preds=rf_proba, name="Random Forest"
     )
 
     # GCN - с уникальным seed (улучшенные параметры)
@@ -1798,10 +2328,7 @@ def main():
     # GRU4Rec - рекуррентная модель для последовательностей
     logger.info(f"Training GRU4Rec with seed={args.random_seed + 4}...")
     
-    # Подготовка данных для GRU4Rec
-    sequences_all, lengths_all, targets_gru = prepare_gru4rec_data(X_raw, y_raw, node_map, service_map, max_seq_len=10)
-    
-    # Split для Sequential моделей
+    # Split для Sequential моделей (данные уже подготовлены выше)
     targets_gru_counts = Counter(targets_gru.numpy())
     min_samples_gru = min(targets_gru_counts.values())
     
