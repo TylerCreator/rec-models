@@ -521,6 +521,158 @@ class DAGGNNRecommender(nn.Module):
         return self.head(h)
 
 
+class DAGNN2021(nn.Module):
+    """
+    True DAGNN implementation from "Directed Acyclic Graph Neural Networks" (Thost & Chen, 2021).
+    
+    Key differences from standard GNN:
+    1. Sequential update by topological order (h_u^ℓ instead of h_u^{ℓ-1})
+    2. Aggregation only from predecessors (not bidirectional)
+    3. Attention-based aggregation
+    4. READOUT from terminal nodes only
+    5. Topological batching for efficiency
+    """
+    def __init__(self, in_channels: int, hidden: int, out_channels: int, 
+                 num_layers: int = 3, num_heads: int = 4, dropout: float = 0.3):
+        super().__init__()
+        self.num_layers = num_layers
+        self.dropout = dropout
+        
+        # Input projection
+        self.input_proj = nn.Linear(in_channels, hidden)
+        
+        # Attention-based aggregation for each layer
+        self.attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(hidden, num_heads, dropout=dropout, batch_first=True)
+            for _ in range(num_layers)
+        ])
+        
+        # Combine functions F^ℓ for each layer
+        self.combine_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden * 2, hidden),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            )
+            for _ in range(num_layers)
+        ])
+        
+        # READOUT: from all layers of terminal nodes
+        self.readout = nn.Sequential(
+            nn.Linear(hidden * (num_layers + 1), hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out_channels)
+        )
+    
+    def topological_sort(self, edge_index, num_nodes):
+        """Compute topological order of nodes."""
+        graph = [[] for _ in range(num_nodes)]
+        indeg = [0] * num_nodes
+        
+        if edge_index.numel() > 0:
+            src, dst = edge_index
+            for u, v in zip(src.tolist(), dst.tolist()):
+                graph[u].append(v)
+                indeg[v] += 1
+        
+        # Topological sort
+        queue = [i for i in range(num_nodes) if indeg[i] == 0]
+        topo_order = []
+        
+        while queue:
+            # Process all nodes at current level (topological batching)
+            current_level = queue[:]
+            queue = []
+            topo_order.append(current_level)
+            
+            for node in current_level:
+                for child in graph[node]:
+                    indeg[child] -= 1
+                    if indeg[child] == 0:
+                        queue.append(child)
+        
+        return topo_order, graph
+    
+    def get_predecessors(self, node, edge_index, num_nodes):
+        """Get direct predecessors of a node."""
+        if edge_index.numel() == 0:
+            return []
+        src, dst = edge_index
+        mask = dst == node
+        return src[mask].tolist()
+    
+    def forward(self, x, edge_index):
+        """
+        Forward pass following DAGNN framework from the paper.
+        
+        h_v^ℓ = F^ℓ(h_v^{ℓ-1}, G^ℓ({h_u^ℓ | u ∈ P(v)}, h_v^{ℓ-1}))
+        """
+        num_nodes = x.size(0)
+        device = x.device
+        
+        # Initialize: h^0 = input projection
+        h = [self.input_proj(x)]  # h[0] = h^0
+        
+        # Get topological order for sequential processing
+        topo_levels, _ = self.topological_sort(edge_index, num_nodes)
+        
+        # Process each layer
+        for layer_idx in range(self.num_layers):
+            h_new = h[layer_idx].clone()  # Start with h^{ℓ-1}
+            
+            # Process nodes in topological order (key difference from MPNN!)
+            for level in topo_levels:
+                for node in level:
+                    # Get predecessors
+                    preds = self.get_predecessors(node, edge_index, num_nodes)
+                    
+                    if len(preds) == 0:
+                        # Source node: no aggregation needed
+                        continue
+                    
+                    # G^ℓ: Aggregate from predecessors using attention
+                    # Important: use h_new (h^ℓ) which contains already updated predecessors!
+                    pred_features = h_new[preds].unsqueeze(0)  # (1, n_preds, hidden)
+                    query = h[layer_idx][node].unsqueeze(0).unsqueeze(0)  # (1, 1, hidden)
+                    
+                    aggregated, _ = self.attention_layers[layer_idx](
+                        query, pred_features, pred_features
+                    )
+                    aggregated = aggregated.squeeze(0).squeeze(0)  # (hidden,)
+                    
+                    # F^ℓ: Combine with previous representation
+                    combined_input = torch.cat([h[layer_idx][node], aggregated])
+                    h_new[node] = self.combine_layers[layer_idx](combined_input)
+            
+            h.append(h_new)  # h[layer_idx + 1] = h^{ℓ}
+        
+        # For node classification: use final layer representations
+        # Concatenate representations from all layers for each node
+        node_reprs = []
+        for node in range(num_nodes):
+            node_repr = torch.cat([h[ℓ][node] for ℓ in range(len(h))])  # all layers
+            node_reprs.append(node_repr)
+        
+        node_reprs = torch.stack(node_reprs)  # (num_nodes, hidden * (L+1))
+        
+        # Final prediction for each node
+        return self.readout(node_reprs)
+    
+    def get_terminal_nodes(self, edge_index, num_nodes):
+        """Get nodes without successors (terminal nodes)."""
+        if edge_index.numel() == 0:
+            return list(range(num_nodes))
+        
+        src, dst = edge_index
+        has_successor = torch.zeros(num_nodes, dtype=torch.bool)
+        has_successor[src.unique()] = True
+        
+        terminal = [i for i in range(num_nodes) if not has_successor[i]]
+        return terminal if terminal else list(range(num_nodes))
+
+
 class GRU4Rec(nn.Module):
     """
     GRU4Rec with techniques from the original ICLR 2016 paper.
@@ -1047,6 +1199,15 @@ def main(args):
     opt_daggnn = torch.optim.Adam(daggnn.parameters(), lr=args.lr * 0.5)
     results["DAG-GNN"] = train_graph_model(
         daggnn, data_pyg, train_idx, test_idx, targets_train, targets_test, opt_daggnn, args.epochs, "DAG-GNN"
+    )
+    
+    # True DAGNN (2021) from Thost & Chen paper
+    dagnn2021 = DAGNN2021(in_channels=2, hidden=args.hidden, out_channels=len(service_map),
+                          num_layers=3, num_heads=4, dropout=args.dropout)
+    opt_dagnn2021 = torch.optim.Adam(dagnn2021.parameters(), lr=args.lr * 0.5)
+    results["DAGNN2021"] = train_graph_model(
+        dagnn2021, data_pyg, train_idx, test_idx, targets_train, targets_test, 
+        opt_dagnn2021, args.epochs, "DAGNN2021"
     )
 
     # GRU4Rec with original techniques
