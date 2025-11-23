@@ -11,7 +11,8 @@ Directed DAG Sequence Models
 2. DirectedDAGNN  (APPNP-style propagation c направленными весами)
 3. DeepDAG (2022) (depth-aware attention)
 4. DAG-GNN (Yu et al., 2019 адаптация) с обучаемыми весами на рёбрах
-5. GRU4Rec (маскирует выходы по направлению графа)
+5. DAGNN2021 (Thost & Chen) - топологическая обработка с attention
+6. GRU4Rec (маскирует выходы по направлению графа)
 
 Usage (пример):
     python directed_dag_models.py --data compositionsDAG.json --epochs 150
@@ -129,9 +130,11 @@ def build_graph(paths: List[List[str]]) -> nx.DiGraph:
     """Build graph with edge weights based on transition frequency in compositions."""
     g = nx.DiGraph()
     edge_counts = defaultdict(int)
+    nodes = set()
     
     # Count how many times each edge appears in paths
     for path in paths:
+        nodes.update(path)
         for i in range(len(path) - 1):
             edge = (path[i], path[i + 1])
             edge_counts[edge] += 1
@@ -140,8 +143,13 @@ def build_graph(paths: List[List[str]]) -> nx.DiGraph:
     for (u, v), count in edge_counts.items():
         g.add_edge(u, v, weight=count)
     
-    logger.info(f"Built graph with {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
-    logger.info(f"Edge weight range: {min(edge_counts.values())} - {max(edge_counts.values())}")
+    if nodes:
+        g.add_nodes_from(nodes)
+    if edge_counts:
+        logger.info(f"Built graph with {g.number_of_nodes()} nodes, {g.number_of_edges()} edges")
+        logger.info(f"Edge weight range: {min(edge_counts.values())} - {max(edge_counts.values())}")
+    else:
+        logger.warning("Built graph with %d nodes but no edges (empty training transitions).", g.number_of_nodes())
     
     return g
 
@@ -224,6 +232,51 @@ def prepare_sequences(contexts: List[Tuple[str, ...]], targets: List[str],
             torch.tensor(labels, dtype=torch.long))
 
 
+def build_node_owner_map(compositions: List[dict]) -> Dict[str, str]:
+    node_owner: Dict[str, str] = {}
+    service_owner: Dict[str, str] = {}
+    for entry in compositions:
+        composition = entry["composition"] if "composition" in entry else entry
+        for node in composition["nodes"]:
+            node_id = str(node["id"])
+            if "mid" in node:
+                node_name = f"service_{node['mid']}"
+                owner = node.get("owner", "unknown")
+            else:
+                node_name = f"table_{node_id}"
+                owner = node_owner.get(node_name, "unknown")
+            node_owner[node_name] = owner
+            if node_name.startswith("service_"):
+                service_owner[node_name] = owner
+
+    for entry in compositions:
+        composition = entry["composition"] if "composition" in entry else entry
+        id_to_name = {}
+        for node in composition["nodes"]:
+            node_id = str(node["id"])
+            if "mid" in node:
+                id_to_name[node_id] = f"service_{node['mid']}"
+            else:
+                id_to_name[node_id] = f"table_{node['id']}"
+
+        for link in composition["links"]:
+            source = str(link["source"])
+            target = str(link["target"])
+            if source not in id_to_name or target not in id_to_name:
+                continue
+            src_name = id_to_name[source]
+            tgt_name = id_to_name[target]
+            if src_name.startswith("table_") and tgt_name in service_owner:
+                node_owner.setdefault(src_name, service_owner[tgt_name])
+            if tgt_name.startswith("table_") and src_name in service_owner:
+                node_owner.setdefault(tgt_name, service_owner[src_name])
+
+    for name in list(node_owner.keys()):
+        if node_owner[name] is None:
+            node_owner[name] = "unknown"
+    return node_owner
+
+
 def split_data(contexts: List[Tuple[str, ...]], targets: List[str], comp_indices: List[int],
                test_size: float, seed: int):
     lb = LabelEncoder().fit(targets)
@@ -272,9 +325,9 @@ class DirectedAPPNPPropagation(nn.Module):
         self.K = K
         self.alpha = alpha
 
-    def forward(self, x, edge_index, edge_weight=None):
-        h0 = x
-        h = x
+    def forward(self, x, edge_index, edge_weight=None, h0=None):
+        if h0 is None:
+            h0 = x
         row, col = edge_index
         num_nodes = x.size(0)
         
@@ -291,17 +344,16 @@ class DirectedAPPNPPropagation(nn.Module):
             deg = torch.bincount(row, minlength=num_nodes).float().clamp(min=1.0).to(x.device)
             edge_norm = 1.0 / deg[row]
         
-        for _ in range(self.K):
-            messages = h[row] * edge_norm.unsqueeze(-1)
-            agg = torch.zeros_like(h).index_add(0, col, messages)
-            h = (1 - self.alpha) * agg + self.alpha * h0
-        return h
+        messages = x[row] * edge_norm.unsqueeze(-1)
+        agg = torch.zeros_like(x).index_add(0, col, messages)
+        return (1 - self.alpha) * agg + self.alpha * h0
 
 
 class DirectedDAGNN(nn.Module):
     def __init__(self, in_channels: int, hidden: int, out_channels: int, K: int = 10, dropout: float = 0.4):
         super().__init__()
         self.dropout = dropout
+        self.num_propagations = K
         
         # First encoding layer
         self.lin1 = nn.Linear(in_channels, hidden)
@@ -313,8 +365,13 @@ class DirectedDAGNN(nn.Module):
         
         # Propagation
         self.prop = DirectedAPPNPPropagation(K=K, alpha=0.1)
-        self.att = nn.Parameter(torch.ones(K + 1))
-        
+        att_hidden = max(1, hidden // 2)
+        self.layer_attention = nn.Sequential(
+            nn.Linear(hidden * 2, att_hidden),
+            nn.GELU(),
+            nn.Linear(att_hidden, K + 1)
+        )
+
         # Output head
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden // 2),
@@ -340,15 +397,18 @@ class DirectedDAGNN(nn.Module):
         x = F.dropout(x, p=self.dropout, training=self.training)
         
         # Propagation with attention (using edge weights)
+        base_features = x
         xs = [x]
         h = x
-        for _ in range(self.att.size(0) - 1):
-            h = self.prop(h, edge_index, edge_weight)
+        for _ in range(self.num_propagations):
+            h = self.prop(h, edge_index, edge_weight, h0=base_features)
             h = F.dropout(h, p=self.dropout, training=self.training)
             xs.append(h)
         stacked = torch.stack(xs, dim=-1)
-        weights = F.softmax(self.att, dim=0)
-        fused = (stacked * weights.view(1, 1, -1)).sum(dim=-1)
+        node_context = torch.cat([xs[0], xs[-1]], dim=-1)
+        att_logits = self.layer_attention(node_context)
+        att_weights = F.softmax(att_logits, dim=-1).unsqueeze(1)
+        fused = (stacked * att_weights).sum(dim=-1)
         
         return self.head(fused)
 
@@ -521,33 +581,25 @@ class DAGGNNRecommender(nn.Module):
         return self.head(h)
 
 
-class DAGNN2021(nn.Module):
+class DAGNN2021Encoder(nn.Module):
     """
-    True DAGNN implementation from "Directed Acyclic Graph Neural Networks" (Thost & Chen, 2021).
-    
-    Key differences from standard GNN:
-    1. Sequential update by topological order (h_u^ℓ instead of h_u^{ℓ-1})
-    2. Aggregation only from predecessors (not bidirectional)
-    3. Attention-based aggregation
-    4. READOUT from terminal nodes only
-    5. Topological batching for efficiency
+    Shared backbone for DAGNN2021-style models.
+    Produces node representations that concatenate states from all propagation layers.
     """
-    def __init__(self, in_channels: int, hidden: int, out_channels: int, 
-                 num_layers: int = 3, num_heads: int = 4, dropout: float = 0.3):
+
+    def __init__(self, in_channels: int, hidden: int, num_layers: int = 3,
+                 num_heads: int = 4, dropout: float = 0.3):
         super().__init__()
         self.num_layers = num_layers
         self.dropout = dropout
-        
-        # Input projection
+        self.hidden = hidden
+        self.output_dim = hidden * (num_layers + 1)
+
         self.input_proj = nn.Linear(in_channels, hidden)
-        
-        # Attention-based aggregation for each layer
         self.attention_layers = nn.ModuleList([
             nn.MultiheadAttention(hidden, num_heads, dropout=dropout, batch_first=True)
             for _ in range(num_layers)
         ])
-        
-        # Combine functions F^ℓ for each layer
         self.combine_layers = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(hidden * 2, hidden),
@@ -557,120 +609,121 @@ class DAGNN2021(nn.Module):
             )
             for _ in range(num_layers)
         ])
-        
-        # READOUT: from all layers of terminal nodes
-        self.readout = nn.Sequential(
-            nn.Linear(hidden * (num_layers + 1), hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, out_channels)
-        )
-    
-    def topological_sort(self, edge_index, num_nodes):
-        """Compute topological order of nodes."""
+
+    def topological_sort(self, edge_index: torch.Tensor, num_nodes: int) -> List[List[int]]:
         graph = [[] for _ in range(num_nodes)]
         indeg = [0] * num_nodes
-        
+
         if edge_index.numel() > 0:
-            src, dst = edge_index
-            for u, v in zip(src.tolist(), dst.tolist()):
+            src = edge_index[0].detach().cpu().tolist()
+            dst = edge_index[1].detach().cpu().tolist()
+            for u, v in zip(src, dst):
                 graph[u].append(v)
                 indeg[v] += 1
-        
-        # Topological sort
+
         queue = [i for i in range(num_nodes) if indeg[i] == 0]
         topo_order = []
-        
+
         while queue:
-            # Process all nodes at current level (topological batching)
             current_level = queue[:]
             queue = []
             topo_order.append(current_level)
-            
+
             for node in current_level:
                 for child in graph[node]:
                     indeg[child] -= 1
                     if indeg[child] == 0:
                         queue.append(child)
-        
-        return topo_order, graph
-    
-    def get_predecessors(self, node, edge_index, num_nodes):
-        """Get direct predecessors of a node."""
+
+        return topo_order
+
+    @staticmethod
+    def get_predecessors(node: int, edge_index: torch.Tensor) -> List[int]:
         if edge_index.numel() == 0:
             return []
         src, dst = edge_index
         mask = dst == node
         return src[mask].tolist()
-    
-    def forward(self, x, edge_index):
-        """
-        Forward pass following DAGNN framework from the paper.
-        
-        h_v^ℓ = F^ℓ(h_v^{ℓ-1}, G^ℓ({h_u^ℓ | u ∈ P(v)}, h_v^{ℓ-1}))
-        """
+
+    @staticmethod
+    def get_terminal_nodes(edge_index: torch.Tensor, num_nodes: int) -> List[int]:
+        if edge_index.numel() == 0:
+            return list(range(num_nodes))
+
+        src = edge_index[0]
+        has_successor = torch.zeros(num_nodes, dtype=torch.bool, device=src.device)
+        if src.numel() > 0:
+            has_successor[src.unique()] = True
+
+        terminal = [i for i in range(num_nodes) if not has_successor[i].item()]
+        return terminal if terminal else list(range(num_nodes))
+
+    def compute_layer_states(self, x: torch.Tensor, edge_index: torch.Tensor) -> List[torch.Tensor]:
         num_nodes = x.size(0)
-        device = x.device
-        
-        # Initialize: h^0 = input projection
-        h = [self.input_proj(x)]  # h[0] = h^0
-        
-        # Get topological order for sequential processing
-        topo_levels, _ = self.topological_sort(edge_index, num_nodes)
-        
-        # Process each layer
+        h_layers = [self.input_proj(x)]
+        topo_levels = self.topological_sort(edge_index, num_nodes)
+
         for layer_idx in range(self.num_layers):
-            h_new = h[layer_idx].clone()  # Start with h^{ℓ-1}
-            
-            # Process nodes in topological order (key difference from MPNN!)
+            prev_h = h_layers[layer_idx]
+            h_new = prev_h.clone()
+
             for level in topo_levels:
                 for node in level:
-                    # Get predecessors
-                    preds = self.get_predecessors(node, edge_index, num_nodes)
-                    
-                    if len(preds) == 0:
-                        # Source node: no aggregation needed
+                    preds = self.get_predecessors(node, edge_index)
+                    if not preds:
                         continue
-                    
-                    # G^ℓ: Aggregate from predecessors using attention
-                    # Important: use h_new (h^ℓ) which contains already updated predecessors!
-                    pred_features = h_new[preds].unsqueeze(0)  # (1, n_preds, hidden)
-                    query = h[layer_idx][node].unsqueeze(0).unsqueeze(0)  # (1, 1, hidden)
-                    
+
+                    pred_features = h_new[preds].unsqueeze(0)
+                    query = prev_h[node].unsqueeze(0).unsqueeze(0)
                     aggregated, _ = self.attention_layers[layer_idx](
                         query, pred_features, pred_features
                     )
-                    aggregated = aggregated.squeeze(0).squeeze(0)  # (hidden,)
-                    
-                    # F^ℓ: Combine with previous representation
-                    combined_input = torch.cat([h[layer_idx][node], aggregated])
+                    aggregated = aggregated.squeeze(0).squeeze(0)
+                    combined_input = torch.cat([prev_h[node], aggregated])
                     h_new[node] = self.combine_layers[layer_idx](combined_input)
-            
-            h.append(h_new)  # h[layer_idx + 1] = h^{ℓ}
-        
-        # For node classification: use final layer representations
-        # Concatenate representations from all layers for each node
+
+            h_layers.append(h_new)
+
+        return h_layers
+
+    def build_node_representations(self, h_layers: List[torch.Tensor]) -> torch.Tensor:
+        num_nodes = h_layers[0].size(0)
         node_reprs = []
         for node in range(num_nodes):
-            node_repr = torch.cat([h[ℓ][node] for ℓ in range(len(h))])  # all layers
+            node_repr = torch.cat([layer[node] for layer in h_layers], dim=0)
             node_reprs.append(node_repr)
-        
-        node_reprs = torch.stack(node_reprs)  # (num_nodes, hidden * (L+1))
-        
-        # Final prediction for each node
+        return torch.stack(node_reprs, dim=0)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        h_layers = self.compute_layer_states(x, edge_index)
+        return self.build_node_representations(h_layers)
+
+
+class DAGNN2021(nn.Module):
+    """
+    Node-level DAGNN classifier (Thost & Chen, 2021) that keeps track of per-node embeddings.
+    """
+
+    def __init__(self, in_channels: int, hidden: int, out_channels: int,
+                 num_layers: int = 3, num_heads: int = 4, dropout: float = 0.3):
+        super().__init__()
+        self.encoder = DAGNN2021Encoder(
+            in_channels=in_channels,
+            hidden=hidden,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        self.readout = nn.Sequential(
+            nn.Linear(self.encoder.output_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out_channels)
+        )
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        node_reprs = self.encoder(x, edge_index)
         return self.readout(node_reprs)
-    
-    def get_terminal_nodes(self, edge_index, num_nodes):
-        """Get nodes without successors (terminal nodes)."""
-        if edge_index.numel() == 0:
-            return list(range(num_nodes))
-        
-        src, dst = edge_index
-        has_successor = torch.zeros(num_nodes, dtype=torch.bool)
-        has_successor[src.unique()] = True
-        
-        terminal = [i for i in range(num_nodes) if not has_successor[i]]
-        return terminal if terminal else list(range(num_nodes))
 
 
 class GRU4Rec(nn.Module):
@@ -684,7 +737,9 @@ class GRU4Rec(nn.Module):
     def __init__(self, num_nodes: int, num_services: int, embedding_dim: int = 64, hidden: int = 128, num_layers: int = 2,
                  dropout_embed: float = 0.25, dropout_hidden: float = 0.4, 
                  dag_successors: Dict[int, List[int]] = None,
-                 dag_successor_nodes: Dict[int, List[int]] = None):
+                 dag_successor_nodes: Dict[int, List[int]] = None,
+                 num_users: int = 0,
+                 user_emb_dim: int = None):
         super().__init__()
         self.embedding = nn.Embedding(num_nodes + 1, embedding_dim, padding_idx=0)
         self.dropout_embed = dropout_embed
@@ -694,11 +749,18 @@ class GRU4Rec(nn.Module):
         self.gru = nn.GRU(embedding_dim, hidden, num_layers=num_layers, 
                          batch_first=True, dropout=dropout_hidden if num_layers > 1 else 0)
         
-        self.fc = nn.Linear(hidden, num_services)
+        self.user_emb_dim = user_emb_dim or hidden
+        self.user_embedding = None
+        fc_input_dim = hidden
+        if num_users and num_users > 0:
+            self.user_embedding = nn.Embedding(num_users, self.user_emb_dim)
+            fc_input_dim = hidden + self.user_emb_dim
+
+        self.fc = nn.Linear(fc_input_dim, num_services)
         self.dag_successors = dag_successors or {}
         self.num_services = num_services
 
-    def forward(self, sequences, lengths, last_nodes=None, compute_scores=False):
+    def forward(self, sequences, lengths, last_nodes=None, compute_scores=False, user_ids=None):
         """
         Args:
             sequences: (batch, seq_len) node indices
@@ -720,14 +782,19 @@ class GRU4Rec(nn.Module):
         last_hidden = gru_out[torch.arange(gru_out.size(0)), lengths - 1]
         
         # Compute logits/scores
+        if self.user_embedding is not None and user_ids is not None:
+            user_emb = self.user_embedding(user_ids)
+            last_hidden = torch.cat([last_hidden, user_emb], dim=1)
+
         logits = self.fc(last_hidden)
         
         # DAG structure masking
         if last_nodes is not None and not compute_scores:
-            mask = torch.zeros_like(logits) - 1e9
+            mask = torch.zeros_like(logits)
             for idx, node in enumerate(last_nodes.tolist()):
                 succ = self.dag_successors.get(node, [])
                 if succ:
+                    mask[idx] = -1e9
                     mask[idx, succ] = 0.0
             logits = logits + mask
         
@@ -951,7 +1018,8 @@ def sample_negatives(targets, num_classes, n_sample, sample_alpha=0.75, item_pop
 
 def train_gru_model(model: GRU4Rec, seq_train, len_train, seq_test, len_test,
                     targets_train, targets_test, last_nodes_train, last_nodes_test,
-                    optimizer, epochs: int, loss_type='ce', n_sample=0, sample_alpha=0.75):
+                    optimizer, epochs: int, loss_type='ce', n_sample=0, sample_alpha=0.75,
+                    user_ids_train=None, user_ids_test=None):
     """
     Train GRU4Rec with original techniques.
     
@@ -984,7 +1052,7 @@ def train_gru_model(model: GRU4Rec, seq_train, len_train, seq_test, len_test,
         
         if loss_type == 'bpr' and n_sample > 0:
             # BPR loss with negative sampling
-            logits = model(seq_train, len_train, last_nodes_train, compute_scores=True)
+            logits = model(seq_train, len_train, last_nodes_train, compute_scores=True, user_ids=user_ids_train)
             
             # Get positive scores
             pos_scores = logits[torch.arange(logits.size(0)), targets_train]
@@ -997,7 +1065,7 @@ def train_gru_model(model: GRU4Rec, seq_train, len_train, seq_test, len_test,
             loss = criterion(pos_scores, neg_scores)
         else:
             # Cross-entropy loss (standard)
-            logits = model(seq_train, len_train, last_nodes_train)
+            logits = model(seq_train, len_train, last_nodes_train, user_ids=user_ids_train)
             loss = criterion(logits, targets_train)
         
         loss.backward()
@@ -1011,7 +1079,7 @@ def train_gru_model(model: GRU4Rec, seq_train, len_train, seq_test, len_test,
     # Evaluation
     model.eval()
     with torch.no_grad():
-        logits = model(seq_test, len_test, last_nodes_test)
+        logits = model(seq_test, len_test, last_nodes_test, user_ids=user_ids_test)
         preds = logits.argmax(dim=1)
         probs = F.softmax(logits, dim=1)
     return compute_metrics(preds.numpy(), targets_test.numpy(), probs.numpy(), "GRU4Rec")
@@ -1089,12 +1157,13 @@ def train_per_dag_gru(model: PerDAGGRU, comp_graphs, comp_node_maps,
 
 
 def compute_metrics(preds, labels, probs, name: str) -> Dict[str, float]:
+    ndcg_k = min(10, probs.shape[1])
     metrics = {
         "accuracy": accuracy_score(labels, preds),
         "f1": f1_score(labels, preds, average="macro", zero_division=0),
         "precision": precision_score(labels, preds, average="macro", zero_division=0),
         "recall": recall_score(labels, preds, average="macro", zero_division=0),
-        "ndcg": ndcg_score(np.eye(probs.shape[1])[labels], probs),
+        "ndcg": ndcg_score(np.eye(probs.shape[1])[labels], probs, k=ndcg_k),
     }
     logger.info("%s metrics: %s", name, metrics)
     return metrics
@@ -1128,15 +1197,26 @@ def main(args):
     logger.info(f"Train set size: {len(ctx_train)} samples ({len(ctx_train)/len(contexts)*100:.1f}%)")
     logger.info(f"Test set size: {len(ctx_test)} samples ({len(ctx_test)/len(contexts)*100:.1f}%)")
 
-    paths_only = [p for p, _ in paths_with_idx]
-    graph = build_graph(paths_only)
-    nodes = list(graph.nodes())
+    train_comp_set = set(comp_train_idx)
+    train_paths_only = [path for path, comp_idx in paths_with_idx if comp_idx in train_comp_set]
+    all_nodes = sorted({node for path, _ in paths_with_idx for node in path})
+    graph = build_graph(train_paths_only)
+    graph.add_nodes_from(all_nodes)
+    nodes = sorted(graph.nodes())
     data_pyg, node_map = prepare_pyg(graph, nodes)
     comp_graphs, comp_node_maps = build_composition_graphs(compositions)
 
     services = sorted({y for y in targets})
     service_map = {svc: idx for idx, svc in enumerate(services)}
     logger.info(f"Number of unique services (classes): {len(services)}")
+
+    node_owner_map = build_node_owner_map(compositions)
+    owner_set = sorted(set(node_owner_map.values()) | {"unknown"})
+    owner_to_idx = {owner: idx for idx, owner in enumerate(owner_set)}
+
+    def get_owner_idx(node_name: str) -> int:
+        owner = node_owner_map.get(node_name, "unknown")
+        return owner_to_idx.get(owner, owner_to_idx["unknown"])
     
     targets_tensor = torch.tensor([service_map[y] for y in targets], dtype=torch.long)
 
@@ -1153,19 +1233,22 @@ def main(args):
         successor_nodes[node_map[u]].append(node_map[v])
 
     seq_all, len_all, labels_all = prepare_sequences(contexts, targets, node_map, service_map, max_len=args.max_len)
+    owner_ids_all = np.array([get_owner_idx(ctx[-1]) for ctx in contexts], dtype=np.int64)
     label_counts = Counter(labels_all.numpy())
     min_seq_count = min(label_counts.values())
     stratify_seq = labels_all.numpy() if min_seq_count >= 2 else None
     if stratify_seq is None:
         logger.warning("Too few samples for stratified sequential split (min=%d). Using random split.", min_seq_count)
-    seq_train, seq_test, len_train, len_test, lab_train, lab_test = train_test_split(
-        seq_all, len_all, labels_all,
+    seq_train, seq_test, len_train, len_test, lab_train, lab_test, user_seq_train, user_seq_test = train_test_split(
+        seq_all, len_all, labels_all, owner_ids_all,
         test_size=args.test_size,
         random_state=args.seed,
         stratify=stratify_seq
     )
     last_nodes_train = torch.tensor([node_map[ctx[-1]] for ctx in ctx_train], dtype=torch.long)
     last_nodes_test = torch.tensor([node_map[ctx[-1]] for ctx in ctx_test], dtype=torch.long)
+    user_seq_train = torch.tensor(user_seq_train, dtype=torch.long)
+    user_seq_test = torch.tensor(user_seq_test, dtype=torch.long)
 
     train_samples_by_comp = defaultdict(list)
     test_samples_by_comp = defaultdict(list)
@@ -1206,10 +1289,10 @@ def main(args):
                           num_layers=3, num_heads=4, dropout=args.dropout)
     opt_dagnn2021 = torch.optim.Adam(dagnn2021.parameters(), lr=args.lr * 0.5)
     results["DAGNN2021"] = train_graph_model(
-        dagnn2021, data_pyg, train_idx, test_idx, targets_train, targets_test, 
+        dagnn2021, data_pyg, train_idx, test_idx, targets_train, targets_test,
         opt_dagnn2021, args.epochs, "DAGNN2021"
     )
-
+    
     # GRU4Rec with original techniques
     gru_model = GRU4Rec(
         num_nodes=len(node_map), 
@@ -1228,7 +1311,7 @@ def main(args):
         last_nodes_train, last_nodes_test, opt_gru, args.epochs,
         loss_type=args.loss, n_sample=args.n_sample, sample_alpha=args.sample_alpha
     )
-    
+
     # PerDAG-GRU - COMMENTED OUT (slow)
     # per_dag_gru = PerDAGGRU(
     #     graph_in_channels=2,
