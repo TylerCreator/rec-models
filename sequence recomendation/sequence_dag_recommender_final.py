@@ -28,6 +28,7 @@
 
 Модели для сравнения:
 - Popularity (baseline)
+- Markov Chain (n-th order, n = max path length in training data)
 - GCN
 - DAGNN
 - DAGNN-Improved (с Focal Loss + Label Smoothing)
@@ -63,7 +64,15 @@ from sklearn.metrics import (
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import LabelBinarizer, LabelEncoder, MultiLabelBinarizer
 from torch_geometric.data import Data
-from torch_geometric.nn import APPNP, GATConv, GCNConv, SAGEConv, GATv2Conv, BatchNorm, LayerNorm
+from torch_geometric.nn import (
+    APPNP,
+    GATConv,
+    GCNConv,
+    SAGEConv,
+    GATv2Conv,
+    BatchNorm,
+    LayerNorm,
+)
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -92,7 +101,7 @@ class DAGNN(nn.Module):
         edge_weight = torch.ones(edge_index.size(1), dtype=torch.float32, device=edge_index.device)
         for _ in range(self.propagation.K):
             x = self.propagation.propagate(edge_index, x=x, edge_weight=edge_weight)
-            if training:
+            if training and self.dropout > 0:
                 x = F.dropout(x, p=self.dropout, training=training)
             xs.append(x)
         out = torch.stack(xs, dim=-1)
@@ -142,6 +151,8 @@ class DAGNNRecommender(nn.Module):
         
         x = self.lin_out(x)
         return x
+
+
 
 
 class GCNRecommender(nn.Module):
@@ -592,6 +603,166 @@ class DAGNNAttention(nn.Module):
         return out
 
 
+class MarkovChain:
+    """
+    Марковская цепь n-го порядка для последовательных рекомендаций
+    
+    Модель учитывает весь доступный контекст (последовательность):
+    - Порядок определяется автоматически из максимальной длины последовательности в обучающих данных
+    - Изучает вероятности переходов на основе всей последовательности
+    - Предсказывает следующий элемент на основе полного контекста
+    - Использует сглаживание Лапласа для обработки неизвестных переходов
+    - Fallback к меньшим порядкам если точная последовательность не встречалась
+    
+    Преимущества марковской модели n-го порядка:
+    - Интерпретируема
+    - Быстро обучается
+    - Учитывает весь доступный контекст из графа
+    - Естественно подходит для последовательных данных
+    """
+    
+    def __init__(self, num_states: int, smoothing: float = 1.0, max_order: int = None):
+        """
+        Args:
+            num_states: Количество состояний (узлов в графе)
+            smoothing: Параметр сглаживания Лапласа (по умолчанию 1.0)
+            max_order: Максимальный порядок цепи (если None, определяется автоматически)
+        """
+        self.num_states = num_states
+        self.smoothing = smoothing
+        self.max_order = max_order
+        self.order = None  # Будет установлен при обучении
+        # Матрица переходов: transition_counts[context_tuple][target] = count
+        self.transition_counts = {}
+        self.context_totals = {}
+        self.num_classes = None  # Будет установлено при обучении
+        self.valid_targets = set()  # Множество валидных целевых классов (сервисов)
+        
+    def fit(self, sequences: torch.Tensor, targets: torch.Tensor, node_map: Dict, service_map: Dict):
+        """
+        Обучение на последовательностях
+        
+        Args:
+            sequences: (batch_size, seq_len) - последовательности узлов (индексы в node_map)
+            targets: (batch_size,) - целевые сервисы (индексы в service_map)
+            node_map: Маппинг всех узлов
+            service_map: Маппинг только сервисов (целевых классов)
+        """
+        logger.info(f"Training Markov Chain (n-th order) on {len(sequences)} sequences...")
+        
+        self.num_classes = len(service_map)
+        self.valid_targets = set(service_map.values())
+        
+        # Определяем порядок цепи из максимальной длины последовательности
+        if self.max_order is None:
+            max_seq_length = 0
+            for seq in sequences:
+                seq_filtered = [s.item() for s in seq if s.item() != 0]
+                max_seq_length = max(max_seq_length, len(seq_filtered))
+            self.order = max_seq_length
+        else:
+            self.order = self.max_order
+        
+        logger.info(f"Markov Chain order: {self.order} (using full context)")
+        
+        # Подсчитываем переходы на основе полного контекста
+        for seq, target in zip(sequences, targets):
+            # Берем только не-padding элементы
+            seq_filtered = tuple([s.item() for s in seq if s.item() != 0])
+            
+            if len(seq_filtered) == 0:
+                continue
+            
+            # Контекст = вся последовательность (n-й порядок)
+            context = seq_filtered
+            
+            # Целевой сервис
+            target_state = target.item()
+            
+            # Обновляем счетчики переходов для полного контекста
+            if context not in self.transition_counts:
+                self.transition_counts[context] = {}
+                self.context_totals[context] = 0
+            
+            if target_state not in self.transition_counts[context]:
+                self.transition_counts[context][target_state] = 0
+            
+            self.transition_counts[context][target_state] += 1
+            self.context_totals[context] += 1
+        
+        logger.info(f"Learned transitions from {len(self.transition_counts)} unique contexts")
+        logger.info(f"Total transitions: {sum(self.context_totals.values())}")
+        logger.info(f"Average context length: {np.mean([len(c) for c in self.transition_counts.keys()]):.2f}")
+        
+    def predict(self, sequences: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Предсказание для тестовых последовательностей с backoff стратегией
+        
+        Стратегия:
+        1. Пытаемся найти точное совпадение полного контекста
+        2. Если не нашли, используем backoff к меньшим порядкам (удаляем первый элемент)
+        3. Если ничего не нашли, используем равномерное распределение
+        
+        Args:
+            sequences: (batch_size, seq_len)
+            
+        Returns:
+            predictions: (batch_size,) - предсказанные классы
+            probabilities: (batch_size, num_classes) - вероятности для каждого класса
+        """
+        predictions = []
+        probabilities = []
+        
+        for seq in sequences:
+            # Берем все не-padding элементы
+            seq_filtered = tuple([s.item() for s in seq if s.item() != 0])
+            
+            if len(seq_filtered) == 0:
+                # Если последовательность пустая, предсказываем равномерное распределение
+                probs = np.ones(self.num_classes) / self.num_classes
+            else:
+                # Пытаемся найти контекст, используя backoff стратегию
+                context = seq_filtered
+                found = False
+                probs = np.zeros(self.num_classes)
+                
+                # Пробуем контексты от полного до минимального (последний элемент)
+                while len(context) > 0:
+                    if context in self.transition_counts:
+                        # Нашли контекст! Вычисляем вероятности
+                        total_count = self.context_totals[context]
+                        
+                        for target_idx in range(self.num_classes):
+                            count = self.transition_counts[context].get(target_idx, 0)
+                            # Сглаживание Лапласа
+                            probs[target_idx] = (count + self.smoothing) / (total_count + self.smoothing * self.num_classes)
+                        
+                        found = True
+                        break
+                    
+                    # Backoff: удаляем первый элемент контекста
+                    context = context[1:]
+                
+                if not found:
+                    # Если ничего не нашли, используем равномерное распределение
+                    probs = np.ones(self.num_classes) / self.num_classes
+                
+                # Нормализуем (на случай ошибок округления)
+                probs = probs / probs.sum()
+            
+            probabilities.append(probs)
+            predictions.append(np.argmax(probs))
+        
+        return np.array(predictions), np.array(probabilities)
+    
+    def predict_proba(self, sequences: torch.Tensor) -> np.ndarray:
+        """
+        Получить только вероятности
+        """
+        _, probs = self.predict(sequences)
+        return probs
+
+
 class GRU4Rec(nn.Module):
     """
     GRU4Rec - Рекуррентная модель для session-based рекомендаций
@@ -940,9 +1111,18 @@ def contexts_to_features(contexts_tensor, node_map, mlb):
     for context_tensor in contexts_tensor:
         # Берем только не-padding элементы (предполагаем что padding = 0 или -1)
         context_names = []
-        for idx in context_tensor.tolist():
-            if idx > 0 and idx in idx_to_node:  # Пропускаем padding
-                context_names.append(idx_to_node[idx])
+        # Если context_tensor это скаляр (int), преобразуем в список
+        if isinstance(context_tensor, (int, torch.Tensor)):
+            if isinstance(context_tensor, torch.Tensor):
+                idx_val = context_tensor.item()
+            else:
+                idx_val = context_tensor
+            if idx_val > 0 and idx_val in idx_to_node:
+                context_names.append(idx_to_node[idx_val])
+        else:
+            for idx in context_tensor.tolist():
+                if idx > 0 and idx in idx_to_node:  # Пропускаем padding
+                    context_names.append(idx_to_node[idx])
         contexts_as_names.append(tuple(context_names) if context_names else ('',))
     
     # Используем MultiLabelBinarizer для преобразования в features
@@ -1218,7 +1398,6 @@ def train_model_with_focal_loss(model, data_pyg, contexts_train, targets_train, 
         model.train()
         optimizer.zero_grad()
         
-        # Forward pass
         if hasattr(model, 'dagnn'):  # DAGNN
             out = model(data_pyg.x, data_pyg.edge_index, training=True)[contexts_train]
         else:  # GCN, GraphSAGE
@@ -1669,6 +1848,7 @@ def cross_validate_models(
     # Инициализируем словарь для хранения результатов каждой модели по всем фолдам
     all_fold_results = {
         'Popularity': [],
+        'Markov Chain': [],
         'Random Forest': [],
         'GCN': [],
         'DAGNN': [],
@@ -1720,7 +1900,18 @@ def cross_validate_models(
         )
         all_fold_results['Popularity'].append(fold_metrics)
         
-        # 2. Random Forest
+        # 2. Markov Chain
+        logger.info(f"\n[Fold {fold_idx}] Training Markov Chain...")
+        markov = MarkovChain(num_states=len(node_map) + 1, smoothing=1.0)
+        markov.fit(sequences_train, targets_train, node_map, service_map)
+        markov_preds, markov_proba = markov.predict(sequences_test)
+        fold_metrics = evaluate_model_with_ndcg(
+            markov_preds, targets_test.numpy(), proba_preds=markov_proba, 
+            name=f"Markov Chain (Fold {fold_idx})"
+        )
+        all_fold_results['Markov Chain'].append(fold_metrics)
+        
+        # 3. Random Forest
         logger.info(f"\n[Fold {fold_idx}] Training Random Forest...")
         # Преобразуем contexts в features для RandomForest
         X_train_rf = contexts_to_features(contexts_train, node_map, mlb)
@@ -1743,7 +1934,7 @@ def cross_validate_models(
         )
         all_fold_results['Random Forest'].append(fold_metrics)
         
-        # 3. GCN
+        # 4. GCN
         logger.info(f"\n[Fold {fold_idx}] Training GCN...")
         torch.manual_seed(args.random_seed + fold_idx * 10 + 1)
         gcn = GCNRecommender(
@@ -1765,7 +1956,7 @@ def cross_validate_models(
         )
         all_fold_results['GCN'].append(fold_metrics)
         
-        # 4. DAGNN
+        # 5. DAGNN
         logger.info(f"\n[Fold {fold_idx}] Training DAGNN...")
         torch.manual_seed(args.random_seed + fold_idx * 10 + 2)
         dagnn = DAGNNRecommender(
@@ -1787,7 +1978,7 @@ def cross_validate_models(
         )
         all_fold_results['DAGNN'].append(fold_metrics)
         
-        # 5. DAGNN-Improved (с Focal Loss)
+        # 6. DAGNN-Improved (с Focal Loss)
         logger.info(f"\n[Fold {fold_idx}] Training DAGNN-Improved (Focal Loss)...")
         
         # Веса классов для текущего фолда
@@ -1837,7 +2028,7 @@ def cross_validate_models(
         )
         all_fold_results['DAGNN-Improved (Focal)'].append(fold_metrics)
         
-        # 6. GraphSAGE
+        # 7. GraphSAGE
         logger.info(f"\n[Fold {fold_idx}] Training GraphSAGE...")
         torch.manual_seed(args.random_seed + fold_idx * 10 + 3)
         sage = GraphSAGERecommender(
@@ -1859,7 +2050,7 @@ def cross_validate_models(
         )
         all_fold_results['GraphSAGE'].append(fold_metrics)
         
-        # 7. GRU4Rec
+        # 8. GRU4Rec
         logger.info(f"\n[Fold {fold_idx}] Training GRU4Rec...")
         gru4rec_preds, gru4rec_proba = train_gru4rec(
             sequences_train, lengths_train, targets_train,
@@ -1880,7 +2071,7 @@ def cross_validate_models(
         )
         all_fold_results['GRU4Rec'].append(fold_metrics)
         
-        # 8. SASRec
+        # 9. SASRec
         logger.info(f"\n[Fold {fold_idx}] Training SASRec...")
         sasrec_preds, sasrec_proba = train_sasrec(
             sequences_train, targets_train, sequences_test, targets_test,
@@ -1900,7 +2091,7 @@ def cross_validate_models(
         )
         all_fold_results['SASRec'].append(fold_metrics)
         
-        # 9. Caser
+        # 10. Caser
         logger.info(f"\n[Fold {fold_idx}] Training Caser...")
         caser_preds, caser_proba = train_caser(
             sequences_train, targets_train, sequences_test, targets_test,
@@ -1920,7 +2111,7 @@ def cross_validate_models(
         )
         all_fold_results['Caser'].append(fold_metrics)
         
-        # 10. DAGNNSequential
+        # 11. DAGNNSequential
         logger.info(f"\n[Fold {fold_idx}] Training DAGNNSequential (DAGNN+GRU)...")
         dagnn_seq_preds, dagnn_seq_proba = train_dagnn_sequential(
             data_pyg,
@@ -1941,7 +2132,7 @@ def cross_validate_models(
         )
         all_fold_results['DAGNNSequential (DAGNN+GRU)'].append(fold_metrics)
         
-        # 11. DAGNNAttention
+        # 12. DAGNNAttention
         logger.info(f"\n[Fold {fold_idx}] Training DAGNNAttention (DAGNN+Attention)...")
         dagnn_att_preds, dagnn_att_proba = train_dagnn_attention(
             data_pyg,
@@ -2348,6 +2539,15 @@ def main():
         )
     
     logger.info(f"Sequential models train: {len(sequences_train)}, test: {len(sequences_test)}")
+    
+    # Markov Chain - используем sequential данные
+    logger.info(f"Training Markov Chain with seed={args.random_seed + 10}...")
+    markov = MarkovChain(num_states=len(node_map) + 1, smoothing=1.0)
+    markov.fit(sequences_train, targets_gru_train, node_map, service_map)
+    markov_preds, markov_proba = markov.predict(sequences_test)
+    results['Markov Chain'] = evaluate_model_with_ndcg(
+        markov_preds, targets_gru_test.numpy(), proba_preds=markov_proba, name="Markov Chain"
+    )
     
     # Обучение GRU4Rec
     gru4rec_preds, gru4rec_proba = train_gru4rec(

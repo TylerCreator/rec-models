@@ -393,9 +393,7 @@ def create_training_data_with_users(
             
             # Исключаем только переходы на таблицы (они стартовые)
             if next_step.startswith("service"):
-                # Определяем owner для этой последовательности
-                # Берем owner целевого сервиса
-                owner = node_to_owner.get(next_step, 'unknown')
+                owner = node_to_owner.get(context[-1], 'unknown') if context else 'unknown'
                 
                 X_raw.append(context)
                 y_raw.append(next_step)
