@@ -9,10 +9,12 @@ Directed DAG Sequence Models
 
 1. Popularity baseline
 2. DirectedDAGNN  (APPNP-style propagation c направленными весами)
-3. DeepDAG (2022) (depth-aware attention)
-4. DAG-GNN (Yu et al., 2019 адаптация) с обучаемыми весами на рёбрах
-5. DAGNN2021 (Thost & Chen) - топологическая обработка с attention
-6. GRU4Rec (маскирует выходы по направлению графа)
+3. DA-GCN (Zhu et al., ACM TOIS 2024) - персонализированные направленные графы с attentive aggregation
+4. DeepDAG (2022) (depth-aware attention)
+5. DAG-GNN (Yu et al., 2019 адаптация) с обучаемыми весами на рёбрах
+6. SR-GNN (Wu et al., AAAI 2019) - session-based GNN
+7. DAGNN2021 (Thost & Chen) - топологическая обработка с attention
+8. GRU4Rec (маскирует выходы по направлению графа)
 
 Usage (пример):
     python directed_dag_models.py --data compositionsDAG.json --epochs 150
@@ -23,16 +25,18 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import networkx as nx
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import Parameter
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, ndcg_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -292,6 +296,45 @@ def split_data(contexts: List[Tuple[str, ...]], targets: List[str], comp_indices
     return ctx_train, ctx_test, y_train, y_test, comp_train, comp_test
 
 
+def build_global_srgnn_adj(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    base = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    if edge_index.numel() > 0:
+        src, dst = edge_index
+        for s, d in zip(src.tolist(), dst.tolist()):
+            base[s, d] += 1.0
+    in_sum = base.sum(0)
+    in_sum[in_sum == 0] = 1.0
+    A_in = base / in_sum.unsqueeze(0)
+    out_sum = base.sum(1)
+    out_sum[out_sum == 0] = 1.0
+    A_out = base.t() / out_sum.unsqueeze(1)
+    return torch.cat([A_in, A_out], dim=1)
+
+
+def build_srgnn_samples_from_contexts(
+        contexts: List[Tuple[str, ...]],
+        targets: List[int],
+        node_map: Dict[str, int]
+) -> List[Tuple[List[int], int]]:
+    samples: List[Tuple[List[int], int]] = []
+    skipped = 0
+    for ctx, target in zip(contexts, targets):
+        indices = []
+        valid = True
+        for node in ctx:
+            if node not in node_map:
+                valid = False
+                break
+            indices.append(node_map[node])
+        if not valid or not indices:
+            skipped += 1
+            continue
+        samples.append((indices, target))
+    if skipped:
+        logger.info("SR-GNN skipped %d contexts without known nodes", skipped)
+    return samples
+
+
 # ---------------------------------------------------------------------------
 # Loss Functions (from original GRU4Rec)
 # ---------------------------------------------------------------------------
@@ -496,6 +539,106 @@ class DeepDAGRecommender(nn.Module):
         attn_mask = self.create_attention_mask(edge_index, x.size(0), x.device)
         h = self.encoder(x, depth, attn_mask)
         return self.head(h)
+
+
+class SRGNNGNN(nn.Module):
+    """
+    Original SR-GNN propagation block (Wu et al., AAAI 2019).
+    """
+
+    def __init__(self, hidden: int, step: int = 1):
+        super().__init__()
+        self.hidden = hidden
+        self.step = step
+        self.input_size = hidden * 2
+        self.gate_size = hidden * 3
+        self.w_ih = Parameter(torch.Tensor(self.gate_size, self.input_size))
+        self.w_hh = Parameter(torch.Tensor(self.gate_size, hidden))
+        self.b_ih = Parameter(torch.Tensor(self.gate_size))
+        self.b_hh = Parameter(torch.Tensor(self.gate_size))
+        self.b_iah = Parameter(torch.Tensor(hidden))
+        self.b_oah = Parameter(torch.Tensor(hidden))
+
+        self.linear_edge_in = nn.Linear(hidden, hidden, bias=True)
+        self.linear_edge_out = nn.Linear(hidden, hidden, bias=True)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+
+    def gnn_cell(self, A: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        seq_len = A.size(1)
+        input_in = torch.matmul(A[:, :, :seq_len], self.linear_edge_in(hidden)) + self.b_iah
+        input_out = torch.matmul(A[:, :, seq_len:], self.linear_edge_out(hidden)) + self.b_oah
+        inputs = torch.cat([input_in, input_out], dim=2)
+        gi = F.linear(inputs, self.w_ih, self.b_ih)
+        gh = F.linear(hidden, self.w_hh, self.b_hh)
+        i_r, i_i, i_n = gi.chunk(3, dim=2)
+        h_r, h_i, h_n = gh.chunk(3, dim=2)
+        resetgate = torch.sigmoid(i_r + h_r)
+        inputgate = torch.sigmoid(i_i + h_i)
+        newgate = torch.tanh(i_n + resetgate * h_n)
+        hy = newgate + inputgate * (hidden - newgate)
+        return hy
+
+    def forward(self, A: torch.Tensor, hidden: torch.Tensor) -> torch.Tensor:
+        for _ in range(self.step):
+            hidden = self.gnn_cell(A, hidden)
+        return hidden
+
+
+class SRGNNRecommender(nn.Module):
+    """
+    SessionGraph implementation from SR-GNN (Wu et al., AAAI 2019).
+    """
+
+    def __init__(self, num_nodes: int, hidden: int, step: int = 1, non_hybrid: bool = False):
+        super().__init__()
+        self.hidden = hidden
+        self.non_hybrid = non_hybrid
+        self.embedding = nn.Embedding(num_nodes + 1, hidden)
+        self.gnn = SRGNNGNN(hidden, step=step)
+        self.linear_one = nn.Linear(hidden, hidden, bias=True)
+        self.linear_two = nn.Linear(hidden, hidden, bias=True)
+        self.linear_three = nn.Linear(hidden, 1, bias=False)
+        self.linear_transform = nn.Linear(hidden * 2, hidden, bias=True)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        stdv = 1.0 / math.sqrt(self.hidden)
+        for weight in self.parameters():
+            weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, items: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        hidden = self.embedding(items)
+        hidden = self.gnn(A, hidden)
+        return hidden
+
+    def gather_sequence(self, hidden: torch.Tensor, alias_inputs: torch.Tensor) -> torch.Tensor:
+        batch_indices = torch.arange(alias_inputs.size(0), device=alias_inputs.device).unsqueeze(-1)
+        return hidden[batch_indices, alias_inputs]
+
+    def compute_scores(self,
+                       seq_hidden: torch.Tensor,
+                       mask: torch.Tensor,
+                       candidate_indices: Optional[torch.Tensor] = None) -> torch.Tensor:
+        seq_len = mask.sum(dim=1).long()
+        last_hidden = seq_hidden[torch.arange(seq_hidden.size(0), device=seq_hidden.device), seq_len - 1]
+        q1 = self.linear_one(last_hidden).unsqueeze(1)
+        q2 = self.linear_two(seq_hidden)
+        alpha = self.linear_three(torch.sigmoid(q1 + q2))
+        mask_expanded = mask.unsqueeze(-1).float()
+        session_rep = torch.sum(alpha * seq_hidden * mask_expanded, dim=1)
+        if not self.non_hybrid:
+            session_rep = self.linear_transform(torch.cat([session_rep, last_hidden], dim=1))
+        candidates = self.embedding.weight[1:]
+        scores = torch.matmul(session_rep, candidates.t())
+        if candidate_indices is not None:
+            scores = scores.index_select(dim=1, index=candidate_indices - 1)
+        return scores
 
 
 def compute_normalized_depth(edge_index: torch.Tensor, num_nodes: int, device: torch.device) -> torch.Tensor:
@@ -726,6 +869,194 @@ class DAGNN2021(nn.Module):
         return self.readout(node_reprs)
 
 
+class DAGCNLayer(nn.Module):
+    """
+    DA-GCN Layer from "Multi-Behavior Recommendation with Personalized Directed 
+    Acyclic Behavior Graphs" (ACM TOIS 2024).
+    
+    Features:
+    - Directed edge encoding with separate weights for each edge type
+    - Attentive aggregation from predecessor nodes
+    - Layer normalization and residual connections
+    """
+    def __init__(self, hidden: int, num_heads: int = 4, dropout: float = 0.3):
+        super().__init__()
+        self.hidden = hidden
+        self.num_heads = num_heads
+        assert hidden % num_heads == 0, "hidden must be divisible by num_heads"
+        self.head_dim = hidden // num_heads
+        
+        # Directed edge encoder - separate transformations for source and target
+        self.edge_src_transform = nn.Linear(hidden, hidden)
+        self.edge_tgt_transform = nn.Linear(hidden, hidden)
+        
+        # Multi-head attention for aggregation from predecessors
+        self.attention = nn.MultiheadAttention(hidden, num_heads, dropout=dropout, batch_first=True)
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden, hidden * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden * 2, hidden)
+        )
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
+        self.dropout = dropout
+        
+    def encode_edges(self, h, edge_index, edge_weight=None):
+        """
+        Encode directed edges with GCN-based approach.
+        Each edge embedding is a function of source and target node features.
+        """
+        if edge_index.numel() == 0:
+            return h
+        
+        src, dst = edge_index
+        
+        # Transform source and target node features
+        h_src = self.edge_src_transform(h[src])  # (num_edges, hidden)
+        h_tgt = self.edge_tgt_transform(h[dst])  # (num_edges, hidden)
+        
+        # Edge embeddings combine source and target
+        edge_emb = h_src + h_tgt  # (num_edges, hidden)
+        
+        # Apply edge weights if provided
+        if edge_weight is not None:
+            edge_emb = edge_emb * edge_weight.unsqueeze(-1)
+        
+        # Aggregate edge embeddings to target nodes
+        num_nodes = h.size(0)
+        aggregated = torch.zeros_like(h)
+        aggregated.index_add_(0, dst, edge_emb)
+        
+        # Normalize by in-degree
+        in_degree = torch.bincount(dst, minlength=num_nodes).clamp(min=1).float().unsqueeze(-1).to(h.device)
+        aggregated = aggregated / in_degree
+        
+        return aggregated
+    
+    def forward(self, h, edge_index, edge_weight=None):
+        """
+        Forward pass with attentive aggregation from predecessors.
+        
+        Args:
+            h: Node features (num_nodes, hidden)
+            edge_index: Edge connectivity (2, num_edges)
+            edge_weight: Optional edge weights (num_edges,)
+        """
+        # Edge encoding and aggregation
+        edge_aggregated = self.encode_edges(h, edge_index, edge_weight)
+        
+        # Self-attention on aggregated features (treats nodes as sequence)
+        h_expanded = h.unsqueeze(0)  # (1, num_nodes, hidden)
+        edge_expanded = edge_aggregated.unsqueeze(0)  # (1, num_nodes, hidden)
+        
+        attn_out, _ = self.attention(h_expanded, edge_expanded, edge_expanded)
+        attn_out = attn_out.squeeze(0)  # (num_nodes, hidden)
+        
+        # Residual connection and normalization
+        h = self.norm1(h + F.dropout(attn_out, p=self.dropout, training=self.training))
+        
+        # Feed-forward network
+        ffn_out = self.ffn(h)
+        h = self.norm2(h + F.dropout(ffn_out, p=self.dropout, training=self.training))
+        
+        return h
+
+
+class DAGCNRecommender(nn.Module):
+    """
+    DA-GCN (Directed Acyclic Graph Convolutional Network) for sequence recommendation.
+    
+    Based on "Multi-Behavior Recommendation with Personalized Directed Acyclic 
+    Behavior Graphs" (Zhu et al., ACM TOIS 2024).
+    
+    Architecture:
+    - Input projection layer
+    - Multiple DA-GCN layers with directed edge encoding
+    - Attentive aggregation from predecessor behaviors
+    - Output classification head
+    """
+    def __init__(self, in_channels: int, hidden: int, out_channels: int,
+                 num_layers: int = 3, num_heads: int = 4, dropout: float = 0.3):
+        super().__init__()
+        self.num_layers = num_layers
+        
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_channels, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout)
+        )
+        
+        # DA-GCN layers
+        self.dagcn_layers = nn.ModuleList([
+            DAGCNLayer(hidden, num_heads, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Layer-wise attention for combining representations from all layers
+        self.layer_attention = nn.Sequential(
+            nn.Linear(hidden * (num_layers + 1), hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_layers + 1),
+            nn.Softmax(dim=-1)
+        )
+        
+        # Output head
+        self.output_head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out_channels)
+        )
+        
+    def forward(self, x, edge_index, edge_weight=None):
+        """
+        Forward pass through DA-GCN.
+        
+        Args:
+            x: Input node features (num_nodes, in_channels)
+            edge_index: Edge connectivity (2, num_edges)
+            edge_weight: Optional edge weights (num_edges,)
+            
+        Returns:
+            logits: Output predictions (num_nodes, out_channels)
+        """
+        # Input projection
+        h = self.input_proj(x)
+        
+        # Store representations from all layers
+        layer_outputs = [h]
+        
+        # Apply DA-GCN layers
+        for layer in self.dagcn_layers:
+            h = layer(h, edge_index, edge_weight)
+            layer_outputs.append(h)
+        
+        # Combine all layer outputs with learnable attention
+        stacked = torch.stack(layer_outputs, dim=-1)  # (num_nodes, hidden, num_layers+1)
+        pooled = stacked.mean(dim=1)  # (num_nodes, num_layers+1)
+        
+        # Compute attention weights
+        att_weights = self.layer_attention(
+            torch.cat(layer_outputs, dim=-1)
+        ).unsqueeze(1)  # (num_nodes, 1, num_layers+1)
+        
+        # Weighted combination of layer outputs
+        h_combined = (stacked * att_weights).sum(dim=-1)  # (num_nodes, hidden)
+        
+        # Output predictions
+        logits = self.output_head(h_combined)
+        
+        return logits
+
+
 class GRU4Rec(nn.Module):
     """
     GRU4Rec with techniques from the original ICLR 2016 paper.
@@ -868,9 +1199,9 @@ def train_graph_model(model, data_pyg, train_idx, test_idx, targets_train, targe
     criterion = nn.CrossEntropyLoss()
     logger.info("Training %s ...", name)
     
-    # Check if model supports edge_weight (DirectedDAGNN does, DAGGNNRecommender doesn't)
+    # Check if model supports edge_weight (DirectedDAGNN and DAGCNRecommender do)
     edge_weight = data_pyg.edge_weight if hasattr(data_pyg, 'edge_weight') else None
-    use_edge_weight = edge_weight is not None and isinstance(model, DirectedDAGNN)
+    use_edge_weight = edge_weight is not None and isinstance(model, (DirectedDAGNN, DAGCNRecommender))
     
     for epoch in range(epochs):
         epoch_start = time.time()
@@ -965,6 +1296,249 @@ def train_deepdag_per_composition(model, comp_graphs, comp_node_maps,
             depth = comp_depths[comp_idx]
             h = model.encoder(data.x, depth)
             logits = model.head(h)
+            
+            node_map = comp_node_maps[comp_idx]
+            node_name = contexts_test[idx][-1]
+            if node_name not in node_map:
+                continue
+            node_id = node_map[node_name]
+            logit = logits[node_id].unsqueeze(0)
+            prob = F.softmax(logit, dim=1)
+            preds_list.append(logit.argmax(dim=1).cpu().numpy())
+            probs_list.append(prob.cpu().numpy())
+            labels_list.append(targets_test_indices[idx])
+
+    if not preds_list:
+        raise RuntimeError(f"No valid test samples for {name}")
+
+    preds = np.concatenate(preds_list, axis=0)
+    probs = np.concatenate(probs_list, axis=0)
+    labels = np.array(labels_list)
+    metrics = compute_metrics(preds, labels, probs, name)
+    return metrics
+
+
+def train_srgnn_per_composition(model, comp_graphs, comp_node_maps,
+                                contexts_train, contexts_test,
+                                comp_indices_train, comp_indices_test,
+                                targets_train_indices, targets_test_indices,
+                                optimizer, epochs: int, name: str,
+                                device: torch.device):
+    import time
+    criterion = nn.CrossEntropyLoss()
+    comp_to_train = defaultdict(list)
+    for idx, comp_idx in enumerate(comp_indices_train):
+        comp_to_train[comp_idx].append(idx)
+
+    logger.info("Training %s (per-composition) with %d compositions...", name, len(comp_to_train))
+    model.to(device)
+
+    for epoch in range(epochs):
+        epoch_start = time.time()
+        model.train()
+        total_loss = 0.0
+        total_samples = 0
+        for comp_idx, sample_indices in comp_to_train.items():
+            data = comp_graphs[comp_idx]
+            if data.x.numel() == 0:
+                continue
+            x = data.x.to(device)
+            edge_index = data.edge_index.to(device)
+            node_map = comp_node_maps[comp_idx]
+            node_states = model.forward(x, edge_index)
+
+            logits_list = []
+            label_list = []
+            for sample_idx in sample_indices:
+                context_nodes = contexts_train[sample_idx]
+                mapped = [node_map.get(node) for node in context_nodes if node in node_map]
+                if not mapped:
+                    continue
+                context_idx = torch.tensor(mapped, dtype=torch.long, device=device)
+                last_idx = context_idx[-1].item()
+                logits = model.session_logits(node_states, context_idx, last_idx)
+                logits_list.append(logits)
+                label_list.append(targets_train_indices[sample_idx])
+
+            if not logits_list:
+                continue
+            batch_logits = torch.cat(logits_list, dim=0)
+            label_tensor = torch.tensor(label_list, dtype=torch.long, device=device)
+            loss = criterion(batch_logits, label_tensor)
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item() * len(logits_list)
+            total_samples += len(logits_list)
+        if total_samples == 0:
+            logger.warning("%s training skipped (no samples).", name)
+            break
+        epoch_time = time.time() - epoch_start
+        if (epoch + 1) % 10 == 0:
+            logger.info("%s Epoch %d/%d loss=%.4f time=%.2fs", name, epoch + 1, epochs, total_loss / total_samples, epoch_time)
+
+    model.eval()
+    preds_list, probs_list, labels_list = [], [], []
+    with torch.no_grad():
+        for idx, comp_idx in enumerate(comp_indices_test):
+            data = comp_graphs[comp_idx]
+            if data.x.numel() == 0:
+                continue
+            x = data.x.to(device)
+            edge_index = data.edge_index.to(device)
+            node_map = comp_node_maps[comp_idx]
+            node_states = model.forward(x, edge_index)
+            context_nodes = contexts_test[idx]
+            mapped = [node_map.get(node) for node in context_nodes if node in node_map]
+            if not mapped:
+                continue
+            context_idx = torch.tensor(mapped, dtype=torch.long, device=device)
+            last_idx = context_idx[-1].item()
+            logit = model.session_logits(node_states, context_idx, last_idx)
+            prob = F.softmax(logit, dim=1)
+            preds_list.append(logit.argmax(dim=1).cpu().numpy())
+            probs_list.append(prob.cpu().numpy())
+            labels_list.append(targets_test_indices[idx])
+
+    if not preds_list:
+        raise RuntimeError(f"No valid test samples for {name}")
+
+    preds = np.concatenate(preds_list, axis=0)
+    probs = np.concatenate(probs_list, axis=0)
+    labels = np.array(labels_list)
+    return compute_metrics(preds, labels, probs, name)
+
+
+def train_srgnn_global_graph(model: SRGNNRecommender,
+                             node_map: Dict[str, int],
+                             data_pyg: Data,
+                             contexts_train: List[Tuple[str, ...]],
+                             contexts_test: List[Tuple[str, ...]],
+                             train_targets: List[int],
+                             test_targets: List[int],
+                             service_indices: torch.Tensor,
+                             optimizer,
+                             epochs: int,
+                             name: str,
+                             device: torch.device):
+    """
+    Train SR-GNN on the same global graph that используется другими моделями.
+    """
+    import time
+
+    train_samples = build_srgnn_samples_from_contexts(contexts_train, train_targets, node_map)
+    test_samples = build_srgnn_samples_from_contexts(contexts_test, test_targets, node_map)
+    if not train_samples or not test_samples:
+        raise RuntimeError("Insufficient SR-GNN samples for training/testing")
+
+    criterion = nn.CrossEntropyLoss()
+    model.to(device)
+    service_indices = service_indices.to(device)
+
+    num_nodes = len(node_map)
+    items_tensor = (torch.arange(num_nodes, dtype=torch.long, device=device) + 1).unsqueeze(0)
+    global_adj = build_global_srgnn_adj(data_pyg.edge_index, num_nodes).to(device).unsqueeze(0)
+
+    def run_epoch(samples: List[Tuple[List[int], int]], training: bool):
+        logits_list, labels_list = [], []
+        hidden = model(items_tensor, global_adj)
+        for seq_indices, label in samples:
+            alias_tensor = torch.tensor([seq_indices], dtype=torch.long, device=device)
+            mask_tensor = torch.ones((1, len(seq_indices)), dtype=torch.float32, device=device)
+            seq_hidden = model.gather_sequence(hidden, alias_tensor)
+            scores = model.compute_scores(seq_hidden, mask_tensor, service_indices)
+            logits_list.append(scores)
+            labels_list.append(label)
+        if not logits_list:
+            return None, None
+        batch_logits = torch.cat(logits_list, dim=0)
+        label_tensor = torch.tensor(labels_list, dtype=torch.long, device=device)
+        if training:
+            loss = criterion(batch_logits, label_tensor)
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            return loss.item(), label_tensor.size(0)
+        probs = F.softmax(batch_logits, dim=1).detach()
+        preds = batch_logits.detach().argmax(dim=1).cpu().numpy()
+        return (preds, probs.cpu().numpy(), label_tensor.cpu().numpy())
+
+    for epoch in range(epochs):
+        epoch_start = time.time()
+        model.train()
+        loss_value, sample_count = run_epoch(train_samples, training=True)
+        epoch_time = time.time() - epoch_start
+        if (epoch + 1) % 10 == 0 and loss_value is not None:
+            logger.info("%s Epoch %d/%d loss=%.4f time=%.2fs",
+                        name, epoch + 1, epochs, loss_value, epoch_time)
+
+    model.eval()
+    preds, probs, labels = run_epoch(test_samples, training=False)
+    if preds is None:
+        raise RuntimeError(f"No valid SR-GNN evaluation samples for {name}")
+    return compute_metrics(preds, labels, probs, name)
+
+
+def train_dagcn_per_composition(model, comp_graphs, comp_node_maps,
+                                contexts_train, contexts_test,
+                                comp_indices_train, comp_indices_test,
+                                targets_train_indices, targets_test_indices,
+                                optimizer, epochs: int, name: str):
+    """
+    Train DA-GCN on per-composition graphs (personalized approach from original paper).
+    """
+    criterion = nn.CrossEntropyLoss()
+    comp_to_train = defaultdict(list)
+    for idx, comp_idx in enumerate(comp_indices_train):
+        comp_to_train[comp_idx].append(idx)
+
+    logger.info("Training %s (per-composition) with %d compositions...", name, len(comp_to_train))
+    import time
+    for epoch in range(epochs):
+        epoch_start = time.time()
+        model.train()
+        total_loss = 0.0
+        total_samples = 0
+        for comp_idx, sample_indices in comp_to_train.items():
+            data = comp_graphs[comp_idx]
+            
+            # Forward pass through DA-GCN
+            logits = model(data.x, data.edge_index)
+            
+            node_ids, label_ids = [], []
+            node_map = comp_node_maps[comp_idx]
+            for sample_idx in sample_indices:
+                node_name = contexts_train[sample_idx][-1]
+                if node_name not in node_map:
+                    continue
+                node_ids.append(node_map[node_name])
+                label_ids.append(targets_train_indices[sample_idx])
+            if not node_ids:
+                continue
+            node_tensor = torch.tensor(node_ids, dtype=torch.long)
+            label_tensor = torch.tensor(label_ids, dtype=torch.long)
+            batch_logits = logits[node_tensor]
+            loss = criterion(batch_logits, label_tensor)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * len(node_ids)
+            total_samples += len(node_ids)
+        if total_samples == 0:
+            logger.warning("%s training skipped (no samples).", name)
+            break
+        epoch_time = time.time() - epoch_start
+        if (epoch + 1) % 10 == 0:
+            logger.info("%s Epoch %d/%d loss=%.4f time=%.2fs", name, epoch + 1, epochs, total_loss / total_samples, epoch_time)
+
+    model.eval()
+    preds_list, probs_list, labels_list = [], [], []
+    with torch.no_grad():
+        for idx, comp_idx in enumerate(comp_indices_test):
+            data = comp_graphs[comp_idx]
+            logits = model(data.x, data.edge_index)
             
             node_map = comp_node_maps[comp_idx]
             node_name = contexts_test[idx][-1]
@@ -1259,6 +1833,8 @@ def main(args):
     for ctx, comp_idx, target_idx in zip(ctx_test, comp_test_idx, test_target_indices):
         test_samples_by_comp[comp_idx].append((ctx, target_idx))
 
+    service_node_indices = torch.tensor([node_map[svc] + 1 for svc in services], dtype=torch.long)
+
     results = {}
     results["Popularity"] = popularity_baseline(targets_train, targets_test, len(service_map))
 
@@ -1267,6 +1843,50 @@ def main(args):
     opt_dagnn = torch.optim.Adam(directed_dagnn.parameters(), lr=args.lr)
     results["DirectedDAGNN"] = train_graph_model(
         directed_dagnn, data_pyg, train_idx, test_idx, targets_train, targets_test, opt_dagnn, args.epochs, "DirectedDAGNN"
+    )
+    
+    # DA-GCN (Zhu et al., ACM TOIS 2024) - Global graph
+    dagcn = DAGCNRecommender(in_channels=2, hidden=args.hidden, out_channels=len(service_map),
+                             num_layers=3, num_heads=4, dropout=args.dropout)
+    opt_dagcn = torch.optim.Adam(dagcn.parameters(), lr=args.lr)
+    results["DA-GCN (global)"] = train_graph_model(
+        dagcn, data_pyg, train_idx, test_idx, targets_train, targets_test, opt_dagcn, args.epochs, "DA-GCN (global)"
+    )
+    
+    # DA-GCN Per-Composition (personalized approach from original paper)
+    # Local DA-GCN обучение отключено ради ускорения сравнения.
+    # dagcn_local = DAGCNRecommender(in_channels=2, hidden=args.hidden, out_channels=len(service_map),
+    #                                num_layers=3, num_heads=4, dropout=args.dropout)
+    # opt_dagcn_local = torch.optim.Adam(dagcn_local.parameters(), lr=args.lr)
+    # results["DA-GCN (local)"] = train_dagcn_per_composition(
+    #     dagcn_local, comp_graphs, comp_node_maps,
+    #     ctx_train, ctx_test,
+    #     comp_train_idx, comp_test_idx,
+    #     train_target_indices, test_target_indices,
+    #     opt_dagcn_local, args.epochs, "DA-GCN (local)"
+    # )
+
+    srgnn_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    srgnn_global = SRGNNRecommender(
+        num_nodes=len(node_map),
+        hidden=args.sr_hidden,
+        step=args.sr_steps,
+        non_hybrid=args.sr_nonhybrid
+    )
+    opt_srgnn_global = torch.optim.Adam(srgnn_global.parameters(), lr=args.sr_lr)
+    results["SR-GNN"] = train_srgnn_global_graph(
+        srgnn_global,
+        node_map,
+        data_pyg,
+        ctx_train,
+        ctx_test,
+        train_target_indices,
+        test_target_indices,
+        service_node_indices,
+        opt_srgnn_global,
+        args.epochs,
+        "SR-GNN",
+        srgnn_device
     )
 
     # DeepDAG2022 - now using global graph like other GNN models
@@ -1283,7 +1903,7 @@ def main(args):
     results["DAG-GNN"] = train_graph_model(
         daggnn, data_pyg, train_idx, test_idx, targets_train, targets_test, opt_daggnn, args.epochs, "DAG-GNN"
     )
-    
+
     # True DAGNN (2021) from Thost & Chen paper
     dagnn2021 = DAGNN2021(in_channels=2, hidden=args.hidden, out_channels=len(service_map),
                           num_layers=3, num_heads=4, dropout=args.dropout)
@@ -1363,6 +1983,14 @@ if __name__ == "__main__":
                        help="Dropout rate for embeddings")
     parser.add_argument("--dropout-hidden", type=float, default=0.4,
                        help="Dropout rate for hidden layers")
+    parser.add_argument("--sr-hidden", type=int, default=128,
+                       help="Hidden dimension for SR-GNN embeddings")
+    parser.add_argument("--sr-steps", type=int, default=1,
+                       help="Number of SR-GNN propagation steps")
+    parser.add_argument("--sr-nonhybrid", action="store_true",
+                       help="Disable hybrid preference (use session context only)")
+    parser.add_argument("--sr-lr", type=float, default=5e-4,
+                       help="Learning rate for SR-GNN optimizer")
     
     args = parser.parse_args()
     main(args)

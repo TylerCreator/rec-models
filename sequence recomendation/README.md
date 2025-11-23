@@ -77,19 +77,28 @@ python 'sequence recomendation/btr_workflow_recommender.py' \
 
 ---
 
-## 🔁 Directed DAG Models (global split 70/30, 200 эпох)
+## 🔁 Directed DAG Models (global split 70/30, 150+ эпох)
 
-Обновлено: 17.11.2025 (`directed_dag_models.py --epochs 200 --hidden 64 --dropout 0.4 --seed 42`)
+Обновлено: 23.11.2025 (`directed_dag_models.py --epochs 150 --hidden 64 --dropout 0.4 --seed 42`)
 
-| Модель           | Accuracy | nDCG  | Macro F1 |
-|------------------|----------|-------|----------|
-| Popularity       | 0.4787   | 0.6597| 0.0539   |
-| DirectedDAGNN    | 0.5115   | 0.7534| 0.1138   |
-| DeepDAG2022      | 0.5213   | 0.7605| 0.1805   |
-| DAG-GNN          | 0.5213   | 0.7571| 0.1805   |
-| DAGNN2021        | 0.5213   | 0.7571| 0.1805   |
-| GRU4Rec (global) | **0.5410** | **0.7781**| **0.2349** |
-| GRU4Rec+User     | 0.5410   | 0.7781| 0.2349   |
+| Модель           | Accuracy | nDCG@10  | Macro F1 | Статья/Год |
+|------------------|----------|----------|----------|------------|
+| Popularity       | 0.4787   | 0.6106   | 0.0540   | Baseline   |
+| DirectedDAGNN    | 0.5213   | 0.7566   | 0.1805   | APPNP-style |
+| **DA-GCN** ⭐    | 0.5115   | 0.7530   | 0.1138   | **ACM TOIS 2024** |
+| DeepDAG2022      | 0.5213   | 0.7571   | 0.1805   | 2022       |
+| DAG-GNN          | 0.5213   | 0.7571   | 0.1805   | Yu et al. 2019 |
+| DAGNN2021        | 0.5213   | 0.7571   | 0.1805   | Thost & Chen 2021 |
+| GRU4Rec (global) | **0.5344** | **0.7674** | **0.2241** | ICLR 2016 |
+
+**Новое:** Добавлена модель **DA-GCN** (Directed Acyclic Graph Convolutional Network) из статьи "Multi-Behavior Recommendation with Personalized Directed Acyclic Behavior Graphs" (Zhu et al., ACM TOIS 2024). 
+
+DA-GCN использует:
+- Направленное кодирование рёбер с отдельными весами для source/target узлов
+- Attentive aggregation от предшественников через multi-head attention
+- Layer-wise attention для комбинирования представлений с разных слоёв
+
+📖 **Подробнее:** [DA_GCN_EXPLAINED.md](DA_GCN_EXPLAINED.md)
 
 Здесь рассматриваются 1 016 пар *(контекст → сервис)*, извлечённых из 943 путей. На этом сплите лучшее качество демонстрирует GRU4Rec с DAG-маской; BTR занимает второе место по nDCG, превышая Directed DAGNN / DeepDAG, но немного уступая GRU4Rec и Personalized DAGNN.
 
